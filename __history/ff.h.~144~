@@ -1,0 +1,253 @@
+#ifndef FF_H
+#define FF_H
+
+#define FFAPI  __declspec(dllexport)
+
+#pragma pack(1)
+
+#include <vcl.h>
+
+#include <math.h>
+#include <windows.h>
+#include "ff.h"
+#include "functions.h"
+#include <winsock2.h>
+#include <stdio.h>
+#include <algorithm>
+#include <stdlib.h>
+#include <string.h>
+#include <vector>
+
+// #pragma package(smart_init)
+#pragma hdrstop
+// #pragma hdrstop
+
+#pragma link "madExcept"
+#pragma link "madLinkDisAsm"
+
+extern "C"
+{
+	int FFAPI __stdcall ff_Init(void);
+	int FFAPI __stdcall ff_ConnectFTP(char*host, int port);
+	int FFAPI __stdcall ff_AuthFTP(char*login, char*pass);
+	int FFAPI __stdcall ff_ScanFTP(int leveldir, unsigned long maxfilesizemb, unsigned long maxdiskusemb);
+	int FFAPI __stdcall ff_MountDisk(char drive_letter);
+	int FFAPI __stdcall ff_Version(void);
+	DWORD FFAPI __stdcall ff_AddEventHandler(LPVOID);
+	int FFAPI __stdcall ff_Clear(void);
+	int FFAPI __stdcall ff_SocketNoDelay(bool);
+	int FFAPI __stdcall ff_SocketOOBInline(bool on);
+	int FFAPI __stdcall ff_SocketBuffers(long bufsize);
+	int FFAPI __stdcall ff_NetSpeed(double*);
+	int FFAPI __stdcall ff_Debug(int = 0);
+	int FFAPI __stdcall ff_ReadAheadMinCache(unsigned long minaheadbytes);
+}
+
+int ftppasvconnect(char*host, int port);
+int count_recs(void*dirptr);
+
+unsigned long nwrite(unsigned long buf, unsigned long offset, unsigned long size, bool paged, bool cachesave,
+	int flags, char*addon);
+void paintdisk(int what, LARGE_INTEGER off, ULONG len, bool paging, unsigned short crc);
+bool nconn(void);
+
+bool ftpconn(bool quick);
+DWORD WINAPI makefatdisk(LPVOID p);
+
+void checknewfiles(char*memptr);
+bool cache_write(long offset, LPVOID buf, ULONG len, int*hits, bool unsaved = true);
+int ftpauth(void);
+void files_sort_diskevent(void);
+
+unsigned long ftpgetfile(char*fname, unsigned long offset, char*buf, unsigned long len, char*dosfn = NULL,
+	unsigned long cacheblocks = 0, unsigned long startoffset = 0);
+
+bool netfat_hasfile(char*dosfn);
+
+void _ftplock(char*func = 0, int line = 0);
+void _ftpunlock(char*func = 0, int line = 0);
+bool ftphasdata(bool wait = false);
+bool in_cache(char*fn, long offset, ULONG len);
+
+unsigned long getfreecluster(void);
+
+unsigned long getbytecluster(unsigned long byte);
+unsigned long getclusterbyte(unsigned long ncl);
+
+// E_FTPPASVDONEPERC
+enum
+{
+	E_APP = -1, E_DEB = 0, E_TIMEOUT, E_FTPGETFILE, E_FTPREPLY, E_FTPCMD, E_TIMEOUTCHANGE, E_SERVERBANNER,
+	E_EXCEPTION, E_FTPAUTHSTART, E_FTPAUTHERR, E_FTPAUTHOK, E_FTPCONNECTING, E_FTPCONNECTED, E_FTPCONNECTERR,
+	E_FTPDISCONNECT, E_FTPPASVERR, E_PASVCONNECTING, E_PASVCONNECTED, E_PASVDISCONNECT, E_DISKERROR,
+	E_DISKREAD, E_DISKWRITE, E_RESOLVEERR, E_FATADD, E_PASVREAD, E_FILEREAD, E_DIRREAD, E_FATSCANDIR,
+	E_FATWRITEFILE, E_CACHEHIT, E_CACHEMISS, E_FTPPREGETFILE, E_CACHESEQDETECT, E_FATREAD, E_FATRESERVEDREAD,
+	E_FATROOTREAD, E_PRECACHED, E_STARTPRECACHE, E_CACHEFREED, E_CACHEMSG, E_FTPCONTROL, E_FTPREADINGLINE,
+	E_FTPREADLINE, E_SECOND = 43, E_UNLOCKING, E_UNLOCKED, E_LOCKING, E_LOCKED, E_DEVMSG = 48, E_FTPSAVEFILE
+};
+
+#define call_events(...) _call_events(__FUNC__,__LINE__,__VA_ARGS__)
+
+void _call_events(char*func, int line, int type, LPVOID arg = NULL, LPVOID arg2 = NULL, LPVOID arg3 = NULL,
+	LPVOID arg4 = NULL, LPVOID arg5 = NULL, LPVOID arg6 = NULL, LPVOID arg7 = NULL, LPVOID arg8 = NULL);
+
+typedef LPVOID(WINAPI * call_func)(int type, LARGE_INTEGER numevent, LPVOID arg, LPVOID arg2, LPVOID arg3,
+	LPVOID arg4, LPVOID arg5, LPVOID arg6, LPVOID arg7, LPVOID arg8);
+
+typedef struct
+{
+	int type;
+	LPVOID addr;
+}EVENT;
+
+typedef struct
+{
+	char sign;
+	char cmd;
+	char paged;
+	char preverrstr[24];
+	char compid[24];
+	int preverr;
+	unsigned long offset;
+	unsigned long size;
+	unsigned long crc;
+	int flags;
+}PKT;
+
+typedef struct
+{
+	char bootcode[446];
+	char part1[16];
+	char part2[16];
+	char part3[16];
+	char part4[16];
+	unsigned short sign;
+}FB;
+typedef struct
+{
+	unsigned char state;
+	unsigned char begin_head;
+	unsigned short begin_cyl_sec;
+	unsigned char type;
+	unsigned char end_head;
+	unsigned short end_cyl_sec;
+	unsigned int mbr_1sec_diff;
+	unsigned int nsectors;
+}PART;
+typedef struct
+{
+	char jump[3];
+	char oem[8];
+	unsigned short bytes_per_sector;
+	unsigned char sectors_per_cluster;
+	unsigned short reserved_sectors;
+	unsigned char fat_copys;
+	unsigned short max_root_ent;
+	unsigned short nsect_less32mb;
+	unsigned char media;
+	unsigned short sectors_per_fat_old; // !fat32
+	unsigned short sectors_per_track;
+	unsigned short heads;
+	unsigned int hidden_sectors;
+	unsigned int sectors;
+	unsigned int sectors_per_fat;
+	unsigned short flags;
+	unsigned short version;
+	unsigned int start_root_cluster;
+	unsigned short file_info_sector;
+	unsigned short backup_boot_sector;
+	char reserved[12];
+	unsigned char logical_drive_num;
+	unsigned char unused;
+	unsigned char sign_0x29;
+	unsigned int serial_num;
+	char volume_name[11];
+	char fat32_name[8];
+	unsigned short sign;
+}FAT32BOOT;
+typedef struct
+{
+	int sign; // 0x41615252
+	char reserved[480];
+	int sign2; // 0x61417272
+	int free_count;
+	int next_free_hint;
+	char reserved2[12];
+	int sign3; // 0xaa550000
+}FSINFO;
+typedef struct
+{
+	unsigned char seq;
+	unsigned char fn5[10];
+	unsigned char attr; // 0x0f
+	unsigned char entry_type;
+	unsigned char cksum;
+	unsigned char fn6[12];
+	unsigned short zero; // 0x00
+	unsigned char fn7[4];
+}LFNDIR;
+
+typedef struct
+{
+	char fname[8];
+	char ext[3];
+	unsigned char attr;
+	char reserved;
+	unsigned char crtimesecs;
+	unsigned short crtime;
+	unsigned short crdate;
+	unsigned short laccessdate;
+	unsigned short st_clust_h;
+	unsigned short lmodtime;
+	unsigned short lmoddate;
+	unsigned short st_clust_l;
+	unsigned int size;
+}DIR;
+
+typedef struct
+{
+	char fn[255];
+	char ftppath[255];
+	bool dir;
+	unsigned long start_offset;
+	unsigned long end_offset;
+	char dosfn[255];
+	unsigned long clusters;
+	unsigned long accesses;
+	DWORD lastaccessed;
+	unsigned long size;
+	unsigned long firstcluster;
+	bool fetched;
+	LPVOID memory;
+	unsigned long memsize;
+	int numrecs;
+
+	void *recptr;
+	unsigned long precachesize;
+	unsigned long precacheclstrs;
+	unsigned long lastoffset;
+	unsigned long lastlen;
+	unsigned long sequential_reads;
+	unsigned long seqoffset;
+	unsigned long seqlen;
+	unsigned short lmodtime;
+	unsigned short crtime;
+	unsigned short laccessdate;
+	unsigned char attr;
+	bool nowwriting;
+	bool unsaved;
+	unsigned long unsavedlen;
+
+	unsigned long numwrites;
+
+	unsigned long lastcachelen;
+	unsigned long lastcacheoffset;
+	unsigned long nextcacheoffset;
+	unsigned long nextcachelen;
+	bool nowcaching;
+	unsigned long nowcachingoffset;
+	unsigned long nowcachinglen;
+	DWORD lastdisktime;
+}FATFILE;
+
+#endif

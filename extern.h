@@ -1,0 +1,46 @@
+#include "ff.h"
+#include "cache.h"
+#include <vector>
+
+#pragma hdrstop
+
+using namespace std;
+
+extern bool unmounting;
+extern TCriticalSection *ecs, *ccs;
+extern unsigned long rntrys;
+extern LONGLONG rlastoffset;
+extern unsigned long wntrys;
+extern LONGLONG wlastoffset;
+extern bool breakpasvread;
+extern bool fatreaded;
+extern unsigned int *fat;
+extern TCriticalSection *filescs;
+extern unsigned long pfat1, pfat2;
+extern int ftpstate;
+extern LONGLONG fatsize;
+extern unsigned long rootdirectory;
+extern int ftplockline;
+extern vector<FATFILE>files;
+extern bool sequential_read;
+extern unsigned long timeoutst;
+extern TCriticalSection *ftpcs;
+extern vector<CACHE>cache;
+extern LONGLONG clstsize;
+extern TEvent *fce;
+extern FAT32BOOT fat32boot;
+extern LONGLONG totcachsize;
+extern unsigned long precacheminbytes;
+extern DWORD ftpcontroltime, ftpdatatime;
+extern char ftpcurdir[128];
+extern bool ramdisk;
+extern double delayperc;
+extern LONGLONG curdisksize;
+extern LPVOID memory;
+extern int totreads, totwrites;
+extern double gt, bt;
+extern int numpkt;
+extern SOCKET ConnectSocket, FtpSocket;
+extern HANDLE hdisk;
+extern char drive_letter;
+extern LONGLONG disksize;

@@ -1,0 +1,39 @@
+	E_DEB (=0)
+           arg1 = string, debug message
+        E_TIMEOUT
+           arg1 = DWORD, timeout code line
+        E_FTPGETFILE
+           arg1 = string, ftp directory
+           arg2 = string, filename
+           arg3 = DWORD, file offset
+           arg4 = void, data buffer
+           arg5 = unsigned long, data size
+        E_FTPREPLY
+           arg1 = string, reply
+        E_FTPCMD
+           arg1 = string, cmd
+        E_TIMEOUTCHANGE
+           arg1 = DWORD, new timeout
+	E_SERVERBANNER
+           arg1 = string, server banner
+
+	E_EXCEPTION 
+
+
+	E_FTPAUTHSTART, 
+
+	E_FTPAUTHERR, 
+	
+	E_FTPAUTHOK,
+	E_FTPCONNECTING, 
+	E_FTPCONNECTED, 
+	E_FTPCONNECTERR, 
+	E_FTPDISCONNECT,
+	E_FTPPASVERR, 
+	E_PASVCONNECT, 
+	E_PASVDISCONNECT, 
+	E_DISKERROR, 
+	E_DISKREAD,
+	E_DISKWRITE, 
+	E_RESOLVEERR, 
+	E_FATADD

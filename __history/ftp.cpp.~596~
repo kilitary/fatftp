@@ -1,0 +1,1726 @@
+#pragma hdrstop
+#include "ff.h"
+#include "ftp.h"
+#include "vdskapi.h"
+#include "disk.h"
+#include "functions.h"
+#include "extern.h"
+#include <vector>
+
+char ftpcmdhist[128], ftprlhist[128];
+char lastftpcmd[1024] = "";
+char lastftprep[1024];
+bool notcheckedabor = true;
+char ftpcs_lockedat[1024] = "unknown!";
+int ftpcs_entered = 0;
+char ftpcs_enteringat[111];
+bool aborted = false;
+bool aboruseoob = false;
+bool ftpdirchanged = true;
+bool gotopen = false;
+char ftpretdir[255] = "";
+
+int ftppasvconnect(char *host, int port)
+{
+	// shutdown(tempsock, SD_BOTH);
+	// closesocket(tempsock);
+
+	// deb("pasv connect %s:%d", host, port);
+
+	DWORD ms = GetTickCount();
+	int ret = 0;
+	closesocket(tempsock);
+	ftpstate = 4;
+	int err;
+	sockaddr_in clientService;
+	tempsock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (tempsock == INVALID_SOCKET)
+	{
+		deb("Client: Error at socket(): %ld\n", WSAGetLastError());
+		ftpstate = -1;
+		return false;
+	}
+
+	// ftppsvblocking(true);
+
+	err = 0;
+	if (setsockopt(tempsock, SOL_SOCKET, SO_REUSEADDR, (char*) & err, sizeof(err)) < 0)
+	{
+		deb("setsockopt(SO_REUSEADDR) failed");
+	}
+	linger lin;
+	lin.l_onoff = 1;
+	lin.l_linger = 0;
+	if (setsockopt(tempsock, SOL_SOCKET, SO_LINGER, (char*) & lin, sizeof(linger)) < 0)
+	{
+		deb("linger: %s", fmterr(WSAGetLastError()));
+	}
+	err = 0;
+
+	if (clientService.sin_addr.s_addr == -1)
+	{
+		deb("resolve %s failed", host);
+
+		tempsock = 0;
+		call_events(E_RESOLVEERR, (LPVOID)host);
+		return false;
+	}
+	// deb("dns: IP %s", inet_ntoa(clientService.sin_addr));
+	memset(&clientService, 0, sizeof(clientService));
+	clientService.sin_family = AF_INET;
+	clientService.sin_addr.s_addr = resolve(ftphost);
+	clientService.sin_port = htons(ftpport);
+
+	ftppsvblocking(false);
+
+	// ff_SocketBuffers(sockets_buffers);
+
+	// if (pasvsockconntimeout < 1000)
+	pasvsockconntimeout = 4000;
+
+	unsigned long ntry = 0;
+
+	call_events(E_PASVCONNECTING, (LPVOID)host, (LPVOID)ftpport);
+
+	if (tempsock <= 0)
+		deb("tempsock %d", tempsock);
+	DWORD st = GetTickCount();
+	while ((ret = connect(tempsock, (SOCKADDR*) & clientService, sizeof(clientService))) == -1)
+	{
+
+		int preverr = 0;
+		err = WSAGetLastError();
+
+		if (err == 10056)
+			break;
+		Sleep(40);
+		// call_events(E_TIMEOUTCHANGE, (LPVOID)(GetTickCount() - ms));
+		// deb("connect err %s", fmterr(err));
+		if (GetTickCount() - ms >= pasvsockconntimeout)
+		{
+			char s[1024];
+			// if(err==10037)
+			// continue;
+
+			sprintf(s, "ftppasvread failed connect %s:%d in %lu ms [err %d: %s],preverr=%d", host, port,
+				pasvsockconntimeout, err, fmterr(err), preverr);
+			preverr = err;
+			call_events(E_TIMEOUT, (LPVOID)__FILE__, (LPVOID)__LINE__, (LPVOID)s);
+			// ftpstate = -1;
+			// // deb(" ! too many connect fails");
+			// deb(s);
+			call_events(E_FTPPASVERR, (LPVOID)s);
+			break;
+		}
+
+		call_events(E_TIMEOUTCHANGE, (LPVOID)(GetTickCount() - st));
+
+		if (err == 10035 || err == 10037)
+			continue;
+	}
+	ms = GetTickCount() - st;
+
+	call_events(E_PASVCONNECTED, (LPVOID)host, (LPVOID)ftpport, (LPVOID)ms);
+	call_events(E_TIMEOUTCHANGE, (LPVOID)(ms));
+
+	if (ms >= 400 && ms <= 2000)
+		pasvsockconntimeout = ms * 5;
+
+	if (!err)
+		err = WSAGetLastError();
+	if (err && err != 10056)
+	{
+		char s[1024];
+		sprintf(s, "ftppasvconnect failed  %s:%d\r\n[err %d: %s]", host, port, err, fmterr(err));
+		deb(s);
+		call_events(E_FTPPASVERR, s);
+		return false;
+	}
+
+	int lport;
+	struct sockaddr_in sa;
+	int nl = sizeof(sa);
+	getsockname(tempsock, (struct sockaddr*) & sa, &nl);
+	lport = ntohs(sa.sin_port);
+	clientService.sin_addr.s_addr = resolve(host);
+	// ftpdeb(" dns: A %s", inet_ntoa(clientService.sin_addr));
+	if (ms >= 500)
+		deb("psv connected %s:%d in %u msecs\n", inet_ntoa(clientService.sin_addr), ftpport, ms);
+
+	return true;
+}
+
+unsigned long ftppasvread(char *host, int port, char *buf, int bufsiz, unsigned long len, char *dosfn,
+	unsigned long cacheblocks, unsigned long startoffset)
+{
+	char tb[22200];
+
+	gotopen = false;
+
+	DWORD ftime = GetTickCount();
+	breakpasvread = false;
+	deb(E_DEVMSG, "ftppasvread(%s, %d, 0x%p, %d, %lu,%s)", host, port, buf, bufsiz, len, dosfn);
+
+	if (HeapSize(GetProcessHeap(), 0, buf) < (unsigned)len)
+	{
+		deb("buf too small for %lu bytes,only %u", len, HeapSize(GetProcessHeap(), 0, buf));
+		return 0;
+	}
+	else
+	{
+		// deb("buf %p OK = %u bytes", buf, HeapSize(GetProcessHeap(), 0, buf));
+	}
+
+	// memset(buf, 0, 4096);
+	DWORD ms = GetTickCount();
+
+	if (ftphasdata())
+	{
+		ftprl(tb, timeoutst, 0);
+
+		if (atoi(tb) == 550)
+		{
+			deb("error 550 for [%s]", dosfn);
+
+			return 0;
+		}
+		gotopen = true;
+	}
+
+	if (!ftppasvconnect(host, port))
+		return 0;
+
+	if (!gotopen)
+	{
+		// Sleep(timeoutst);
+		if (ftphasdata())
+		{
+			ftprl(tb, timeoutst, 0);
+			gotopen = true;
+		}
+		if (atoi(tb) == 550)
+		{
+			deb("error 550 for [%s]", dosfn);
+			closesocket(tempsock);
+			tempsock = 0;
+			return 0;
+		}
+		while (ftphasdata())
+		{
+			ftprl(tb, timeoutst, 0);
+			if (atoi(tb) == 550)
+			{
+				deb("file not found");
+				closesocket(tempsock);
+				tempsock = 0;
+				// ds;
+				return 0;
+			}
+			Sleep(timeoutst);
+			gotopen = true;
+
+		}
+	}
+
+	// int sb = sockets_buffers;
+	//
+	// int ret = setsockopt(tempsock, SOL_SOCKET, SO_RCVBUF, (unsigned char*) & sb, sizeof(int));
+	// if (ret == SOCKET_ERROR)
+	// deb(" ff_SocketBuffers setsockopt : %s ", fmterr());
+
+	ms = GetTickCount() - ms;
+
+	ftpstate = 2;
+
+	// if (ms)
+	// {
+
+	int ss = 0;
+	char *ptr = buf;
+	bool cont = true;
+	int readleft = len ? len : bufsiz;
+	if (!len && !bufsiz)
+	{
+		readleft = 16384;
+		cont = true;
+	}
+	bool exact = false;
+	if (len == (unsigned long)bufsiz && len)
+		exact = true;
+	unsigned long readok = 0;
+	DWORD tms = GetTickCount();
+	int numr = 0;
+	char tempbuf[8192];
+	bool tempreading = false;
+
+	DWORD ltms = 0;
+	// ftppsvblocking(false);
+	DWORD lastinms = timeoutst;
+	// deb("passive start recv @ %p", ptr);
+	ftppsvblocking(false);
+	int lastreadok = 0;
+	unsigned long numrecvs = 0;
+	unsigned long ptrsiz;
+	ptrsiz = (unsigned long)HeapSize(GetProcessHeap(), 0, ptr);
+	// deb("passive read block size %lu (%p), blocksize=%lu", ptrsiz, ptr, cacheblocks);
+	unsigned long sleeps = 0;
+	int err = 0;
+
+	DWORD lastetime = 0, lasterrtime = 0;
+	lastetime = GetTickCount();
+	ltms = GetTickCount();
+	deb("passive reading start");
+	DWORD lastsstime = GetTickCount();
+	if (cacheblocks)
+		deb(E_DEVMSG, "ftppasvread caching read %lu", len);
+	while (true)
+	{
+		if (cacheblocks && breakpasvread && readok >= 512000)
+		{
+			deb(E_DEVMSG, "breaking due to breakpasvread: readok: %lu", readok);
+			break;
+		}
+
+		ftpstate = 4;
+		DWORD tms2 = GetTickCount();
+
+		if (unmounting)
+			return readok;
+
+		try
+		{
+//			unsigned long readsize;
+//			// readsize = cacheblocks ? cacheblocks : 131072; // (cacheblocks > readleft ? cacheblocks : readleft) :
+//			readsize = len > sockets_buffers ? sockets_buffers : len;
+//			if (!sockets_buffers && !len)
+//				readsize = 65535;
+			// (readleft > 131072 ? 131072 : readleft);
+			// deb(E_FTPCONTROL, "execing recv(%d, %p, %lu, 0)", tempsock, ptr, readleft);
+			if (IsBadWritePtr(ptr, readleft))
+			{
+				deb(E_FTPCONTROL, "bad write ptr pasv recv @ %p", ptr);
+				deb("  %p bufsize = %u, len = %lu", buf, HeapSize(GetProcessHeap(), 0, buf), len);
+				ds;
+			}
+			ss = recv(tempsock, (char*)ptr, readleft, 0);
+
+			lasterrtime = GetTickCount();
+			err = WSAGetLastError();
+			// if (ss == -1)
+			// deb("ss %d err %d", ss, err);
+			if (ss == -1 || ss <= 1500)
+				Sleep(1);
+
+			if (ss == -1 && (GetTickCount() - ltms))
+				call_events(E_TIMEOUTCHANGE, (LPVOID)(GetTickCount() - ltms));
+
+			if (ss > 16384)
+				deb(E_DEVMSG, "   recv(%8lu) = %5d, timediff %d", readleft, ss, GetTickCount() - ltms);
+
+			if (ftphasdata())
+			{
+				ftprl(tb, timeoutst, 0);
+				gotopen = true;
+			}
+
+		}
+		catch(Exception & e)
+		{
+			char sss[1111];
+			deunicode(e.Message.c_str(), sss, sizeof(sss));
+			fdeb("  recv except %s", sss);
+			exp;
+		}
+		// ftppsvblocking(false);
+		numrecvs++;
+
+		if (ss == 0)
+		{
+
+			deb(" break  pasv read (ss=0) @ %lu", readok);
+			break;
+		}
+
+		if (ss < 0)
+		{
+			// err = WSAGetLastError();
+			if (err == 10035)
+			{
+				Sleep(30);
+				// sleeps += 100;
+			}
+			else if (err == 10053 && exact && readok < len)
+			{
+				call_events(E_PASVDISCONNECT, (LPVOID)host, (LPVOID)ftpport,
+					(LPVOID)(GetTickCount() - ftime), (LPVOID)readok);
+				deb(E_FTPCONTROL,
+					"recv()=%s\r\nlost pasv connection @ byte %lu\r\nreconnecting %s:%d [max %lu ms]...",
+					fmterr(err), readok, host, port, pasvsockconntimeout);
+				if (ftphasdata())
+					ftprl(tb, timeoutst, 0);
+
+				// if (!ftppasvconnect(host, port))
+				{
+					deb("  unsuccessful reconect");
+					break;
+				}
+			}
+			else
+			{
+				if (err)
+					deb("  recv ss: %d, exact %d readok %lu recv: %d %s", ss, exact, readok, err,
+					fmterr(err));
+				// Sleep(timeoutst);
+				// deb("ss %d err %d", ss, err);
+				// if (err)
+				break;
+			}
+		}
+
+		if (GetTickCount() - tms2 > 0)
+			lastdelay = GetTickCount() - tms2;
+
+		int done;
+		if (ss > 0)
+		{
+			if (!gotopen && ss > 0)
+			{
+
+				// call_events(E_TIMEOUTCHANGE, (LPVOID)ms);
+			}
+
+			ltms = GetTickCount();
+			lastpasvread = ss;
+
+			// if (readok - lastreadok >= clstsize / 2)
+			if ((GetTickCount() - lastetime >= 150 || cacheblocks) && ss > 0)
+			{
+				call_events(E_PASVREAD, (LPVOID)readok, (LPVOID)len, (LPVOID)bufsiz);
+				// call_events(E_TIMEOUTCHANGE, (LPVOID)(GetTickCount() - lastetime));
+				lastetime = GetTickCount();
+				lastreadok = readok;
+
+				// deb("  recv() = %d readok:%lu -- %lu", ss, readok, GetTickCount() - tms);
+			}
+
+			if (cacheblocks)
+			{
+				// deb("saving '%s' @ %lu, ss %d, ptr %p..", dosfn, startoffset + readok, ss, ptr);
+				DWORD xyutm;
+				xyutm = GetTickCount();
+				cache_save("", dosfn, startoffset + readok, ss, ptr);
+				if (GetTickCount() - xyutm >= 500)
+					deb(E_CACHEMSG, "  saved %lu in %d ms", ss, GetTickCount() - xyutm);
+			}
+
+			readok += ss;
+			numr = 0;
+
+			ptr = ptr + ss;
+
+			if (ss > 1)
+			{
+				ilastlen = (double)ss;
+				ibytesin += (double)ss;
+			}
+		}
+
+		if ((readleft - ss) >= 0 && ss > 0)
+			readleft -= ss;
+
+		if (exact && readok >= len)
+		{
+			deb("  recved exact %lu bytes", readok);
+			ftpabor();
+			break;
+		}
+
+		if (ss == 0 && GetTickCount() - lastsstime >= 5000 && !readok)
+		{
+			call_events(E_TIMEOUT, (LPVOID)__FILE__, (LPVOID)__LINE__,
+				(LPVOID)"maxpasv reach 6 sec, no data!");
+			if (err != 10035)
+			{
+				deb("  no psv data err: %d ss %d %s", err, ss, fmterr(err));
+				break;
+			}
+			Sleep(11);
+		}
+		else
+		{
+			if (ss > 0)
+				lastsstime = GetTickCount();
+		}
+		if (ptrsiz && readok > ptrsiz)
+		{
+			deb("  readok pasv read buf overflow: readed %lu, buffer only %lu", readok, ptrsiz);
+			ds;
+		}
+	}
+
+	// deb("done data read = %d,ss=%d", readok, ss);
+	// if (ss <= 0)
+	// {
+	// if (!err)
+	// err = WSAGetLastError();
+	// if (err)
+	// deb(E_FTPCONTROL, "recv ret:%d err:%d [%s]", ss, err, fmterr(err));
+	// }
+	// else
+	if (ss > 0)
+	{
+		lastreadok = readok;
+	}
+
+	ftppsvblocking(true);
+	// recv(tempsock, 0, 0, 0);
+	shutdown(tempsock, SD_RECEIVE);
+	closesocket(tempsock);
+
+	tempsock = 0;
+
+	call_events(E_PASVREAD, (LPVOID)readok, (LPVOID)len, (LPVOID)bufsiz);
+	call_events(E_PASVDISCONNECT, (LPVOID)host, (LPVOID)ftpport, (LPVOID)(GetTickCount() - ftime),
+		(LPVOID)readok);
+
+	if (!gotopen || (!strstr(tb, "226 ") && !strstr(tb, "426 ")))
+	{
+		// if (ftphasdata())
+		ftprl(tb, timeoutst, 0);
+
+		// ftpabor();
+	}
+	// }
+	tms = GetTickCount() - tms;
+	ftpstate = -1;
+	ftime = GetTickCount() - ftime;
+	ftpdatatime += ftime;
+
+	while (ftphasdata())
+		ftprl(tb, timeoutst, 0);
+
+	deb(E_DEVMSG, "ftppasvread() = read %d, numr: %lu ss %d, %lu мс, numrecvs: %lu,sleeps:%lu", readok, numr,
+		ss, ftime, numrecvs, sleeps);
+
+	return readok;
+}
+
+bool ftphasdata(bool wait)
+{
+	int canread;
+	if (!FtpSocket)
+		return false;
+	ftpblocking(false);
+	char c;
+	int err = 10035;
+	canread = recv(FtpSocket, &c, 1, MSG_PEEK);
+	if (canread > 0)
+		return true;
+	err = WSAGetLastError();
+	ftpblocking(true);
+	if (err != 10035)
+		deb("canread: %d [err:%d] FtpSock %d [%s]", canread, err, FtpSocket, fmterr(err));
+	return false;
+}
+
+bool ftpconn(bool quick)
+{
+	ftpstate = -2;
+	loggedin = false;
+	unsigned long iMode = 1;
+	static int checkdone = true;
+	timeoutst = 5000;
+
+	shutdown(FtpSocket, SD_BOTH);
+	closesocket(FtpSocket);
+
+	FtpSocket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (FtpSocket == INVALID_SOCKET)
+	{
+		deb("Client: socket(): %ld\n", WSAGetLastError());
+		return false;
+	} // deb("tcp.socket max recv() size = %u", (unsigned long)iMode);
+
+	int sb = 16384;
+
+	setsockopt(FtpSocket, SOL_SOCKET, SO_RCVBUF, (unsigned char*) & sb, sizeof(int));
+	setsockopt(FtpSocket, SOL_SOCKET, SO_SNDBUF, (unsigned char*) & sb, sizeof(int));
+
+	sockaddr_in clientService;
+	clientService.sin_family = AF_INET;
+	DWORD ftime = GetTickCount();
+	clientService.sin_addr.s_addr = resolve(ftphost);
+	// inet_addr(host);
+	ftime = GetTickCount() - ftime;
+	ftpdatatime += ftime;
+	call_events(E_TIMEOUTCHANGE, (LPVOID)ftime);
+	clientService.sin_port = htons(ftpstartport);
+	if (clientService.sin_addr.s_addr == 0)
+	{
+		deb("failed to resolve[%s]: %s", ftphost, fmterr(WSAGetLastError()));
+		call_events(E_RESOLVEERR, (LPVOID)ftphost, (LPVOID)fmterr(WSAGetLastError()));
+		return false;
+	}
+	// ioctlsocket(FtpSocket, FIONBIO, (unsigned long*) & iMode);
+	//
+	int lport;
+	struct sockaddr_in sa;
+	int nl = sizeof(sa);
+	if (unmounting)
+		ExitThread(0);
+	deb("connecting %s:%d (%s) ...", ftphost, ftpstartport, ip);
+	// ftpblocking(false);
+
+	call_events(E_FTPCONNECTING, (LPVOID)ftphost, (LPVOID)ftpport);
+	DWORD ms = GetTickCount();
+	ftpblocking(false);
+	while (int ret = connect(FtpSocket, (SOCKADDR*) & clientService, sizeof(clientService)) == -1)
+	{
+		int err = WSAGetLastError();
+		if (err == 10056)
+		{
+			// deb("FtpSocket already connected [%s:%d]", ftphost, ftpstartport);
+			break;
+		}
+		else
+		{
+			// Sleep(rand() % 10);      g
+			// deb("ftpconn err:%d [%s]", err, fmterr(err));
+		}
+		call_events(E_TIMEOUTCHANGE, (LPVOID)(GetTickCount() - ms));
+		if (GetTickCount() - ms >= timeoutst)
+		{
+			deb("ftpconn() failed connect(%s,%d) =\r\n  %s", ftphost, ftpstartport, fmterr(err));
+			FtpSocket = 0;
+			call_events(E_FTPCONNECTERR, (LPVOID)fmterr(err));
+			return false;
+		}
+
+		Sleep(10);
+	}
+	ms = GetTickCount() - ms;
+	call_events(E_TIMEOUTCHANGE, (LPVOID)(ms));
+	call_events(E_FTPCONNECTED, (LPVOID)ftphost, (LPVOID)ftpport);
+	bool nodelay = sockets_nodelay;
+	//
+	int ret = setsockopt(FtpSocket, SOL_SOCKET, TCP_NODELAY, (char*) & nodelay, sizeof(bool));
+	if (SOCKET_ERROR == ret)
+		deb("sockets_nodelay(%d): %s", sockets_nodelay, fmterr(WSAGetLastError()));
+	bool oob = sockets_oobinline;
+	//
+	ret = setsockopt(FtpSocket, SOL_SOCKET, SO_OOBINLINE, (char*) & oob, sizeof(bool));
+	if (SOCKET_ERROR == ret)
+		deb("sockets_OOB(%d): %s", oob, fmterr(WSAGetLastError()));
+	// setsockopt(FtpSocket, SOL_SOCKET, SO_DEBUG, (unsigned char*)&iMode, 1);
+	iMode = true;
+	setsockopt(FtpSocket, SOL_SOCKET, SO_KEEPALIVE, (char*) & iMode, 1);
+	ff_SocketBuffers(sockets_buffers);
+	getsockname(FtpSocket, (struct sockaddr*) & sa, &nl);
+	strcpy(ip, inet_ntoa(sa.sin_addr));
+	timeoutst = ms ? ms * 5 : 5000;
+	// call_events(E_TIMEOUTCHANGE, (LPVOID)timeoutst);
+	char buf[65535];
+	lport = ntohs(sa.sin_port);
+	ftplport = lport;
+	int err = WSAGetLastError();
+	deb("%6lu ms, %s:%d <=> %s:%d, err=%d, timeoutst=%d  ", ms, ftphost, ftpport, ip, lport, err, timeoutst);
+	ftpstate = -1;
+
+	ms = GetTickCount();
+	ftprl(buf, timeoutst, "220");
+	int bl = 0;
+	if (strlen(buf) < 2)
+	{
+		deb("no server banner or 220 code!");
+		closesocket(FtpSocket);
+		FtpSocket = 0;
+		call_events(E_FTPDISCONNECT, (LPVOID)"нет кода приветствия 220!");
+		return false;
+	}
+
+	bl = strlen(buf);
+	if (bl)
+		call_events(E_SERVERBANNER, buf);
+	while (ftphasdata())
+	{
+		ftprl(buf, timeoutst, 0);
+		if (strlen(buf))
+			call_events(E_SERVERBANNER, buf);
+		bl += strlen(buf);
+	}
+
+	ms = GetTickCount() - ms;
+	deb("read %d bytes in %lu ms", bl, ms);
+	if (!quick)
+		ftpauth();
+	return true;
+}
+
+void ftppsvblocking(bool block)
+{
+	unsigned long iMode;
+
+	iMode = !block;
+	int ret = ioctlsocket(tempsock, FIONBIO, (unsigned long*) & iMode);
+	if (ret == SOCKET_ERROR)
+	{
+		deb("ioctlsocket tempsock nonbblock(%d): %s", block, fmterr(WSAGetLastError()));
+		ds;
+	}
+	// ioctlsocket(tempsock, FIONREAD, (unsigned long*)&iMode);
+}
+
+unsigned long ftpsavefile(char *ftpdir, char *fn, char* buf, unsigned long len, unsigned long offset)
+{
+	deb(E_DEVMSG, "ftpsavefile(%s, %s, %p, %lu, %lu)", ftpdir, fn, buf, len, offset);
+
+	ftplock();
+
+	if (!FtpSocket)
+		ftpconn(true);
+
+	char tb[10214];
+
+	// ftpcmd("TYPE I", 0, 0);
+	// ftprl(tb, timeoutst, 0);
+
+	if (offset)
+	{
+		sprintf(tb, "REST %lu", offset);
+		// rr = send(FtpSocket, tb, strlen(tb), 0);
+		ftpcmd(tb, 0, 0);
+		tb[0] = 0;
+		memset(tb, 0, sizeof(tb));
+		ftprl(tb, timeoutst, "350");
+	}
+
+	DWORD tmepsv = GetTickCount();
+
+	int pasv_run = true;
+	int numrun = 0;
+
+	while (ftphasdata())
+	{
+		ftprl(tb, timeoutst, 0);
+		Sleep(timeoutst);
+	}
+
+	while (pasv_run)
+	{
+
+		ftpcmd("PASV", 0, 0);
+		ftprl(tb, timeoutst, 0);
+		while (ftphasdata())
+			ftprl(tb, timeoutst, 0);
+
+		if (strstr(tb, "227 En"))
+		{
+			pasv_run = false;
+
+		}
+		if (numrun++ >= 2)
+		{
+			ftpunlock();
+			return 0;
+		}
+		Sleep(timeoutst < 50 ? timeoutst : 50);
+		// }
+	}
+
+	DWORD tms = GetTickCount();
+
+	char fnn[255];
+	sprintf(fnn, "%s", fn);
+	for (int i = 0; i < strlen(fnn); i++)
+		if (fnn[i] == '~')
+			fnn[i] = '1';
+	// deb("storing [%s]", fnn);
+
+	sprintf(tb, "STOR %s", fnn);
+
+	ftpcmd(tb, 0, 0);
+
+	// Sleep(40);
+
+	// ftprl(tb, timeoutst, 0);
+	// if (atoi(tb) != 150)
+	// {
+	// deb("stor error: %s", tb);
+	// // ds;
+	// return 0;
+	// }
+	gotopen = false;
+	unsigned long rrr = ftppasvsave(ftphost, ftpport, fn, buf, len, len, offset);
+
+	static char aftershock[128] = "";
+
+	while (ftphasdata())
+	{
+		ftprl(aftershock, timeoutst, 0);
+		Sleep(timeoutst);
+	}
+
+	// sprintf(tb, "SIZE %s", fn);
+	// ftpcmd(tb, 0, 0);
+	//
+	// ftprl(tb, timeoutst, "213 ");
+	// char *p = strstr(tb, "213 ");
+	// unsigned long siz = 0;
+	// if (p)
+	// {
+	// siz = atol(p + 4);
+	// deb(E_FTPCONTROL, "size of %s = %lu", fn, siz);
+	// }
+
+	call_events(E_FTPSAVEFILE, (LPVOID)fn, (LPVOID)buf, (LPVOID)len, (LPVOID)offset, (LPVOID)rrr,
+		(LPVOID)aftershock);
+
+	ftpunlock();
+
+	return rrr;
+}
+
+void ftpblocking(bool block)
+{
+	unsigned long iMode;
+	iMode = !block;
+
+	if (FtpSocket <= 0)
+	{
+		// deb("ftpblocking zero socket!");
+		return;
+	}
+	ioctlsocket(FtpSocket, FIONBIO, (unsigned long*) & iMode);
+	// ioctlsocket(FtpSocket, FIONREAD, (unsigned long*)&iMode);
+
+}
+
+int _ftprl(char *func, int line, char *buf, DWORD maxms = 0, char *sign = 0)
+{
+	char *bp = buf;
+	int nr = 0;
+	int ss = 0;
+	memset(buf, 0, 2056);
+	buf[0] = 1;
+	int totr = 0;
+	DWORD ftime = GetTickCount();
+
+	int err = 0;
+
+	try
+	{
+		if (unmounting)
+		{
+			ExitThread(0);
+		}
+		sprintf(ftprlhist, "%s():%5d -> ftprl(maxms=%lu,sign=%s)", func, line, (unsigned long)maxms,
+			(int)sign > 0 ? sign : "");
+		ftpstate = 0;
+		char blaaa[1111];
+		ftpblocking(false);
+		DWORD tms = GetTickCount();
+		int flags = 0;
+
+		call_events(E_FTPREADINGLINE, (LPVOID)func, (LPVOID)line);
+		// ftplock();
+		while (true)
+		{
+			if (ss > 0)
+				bp++;
+			// ftpblocking(false);
+			ss = recv(FtpSocket, bp, 1, flags);
+			// ftpblocking(true);
+			if (ss > 0 && !*bp && !sign)
+				break;
+
+			if (ss > 0)
+			{
+				ibytesin += ss;
+				if (ss > 1)
+					ilastlen = (double)ss;
+				totr += ss;
+			}
+
+			if (maxms > 0 && (int)sign == 0 && GetTickCount() - tms >= maxms / 4 && ss <= 0 && strstr(buf,
+					"\r\n"))
+				break;
+
+			if (GetTickCount() - tms >= 10400)
+			{
+				deb("%s max rl timeout", ftprlhist);
+				err = WSAGetLastError();
+				sprintf(ftprlhist, "wsaerror= %d, %s", err, fmterr(err));
+				call_events(E_TIMEOUT, (LPVOID)func, (LPVOID)line, (LPVOID)ftprlhist);
+				break;
+			}
+			if (maxms == (DWORD) - 1 && GetTickCount() - tms >=
+				(totr ? lastdelay ? lastdelay * 3 : 100 : timeoutst))
+			{
+				call_events(E_TIMEOUT, (LPVOID)__FILE__, (LPVOID)__LINE__);
+				break;
+			}
+			// if (maxms > 0 && GetTickCount() - tms >= maxms && !sign)
+			// break;
+			if (((int)sign > 0 && ss <= 0 && strstr(buf, sign) && strstr(buf, "\r\n")))
+			{
+				break;
+			}
+			// if ((int)sign <= 0 && strstr(buf, "\r\n"))
+			// break;
+			if (!ss)
+				break;
+			if (ss == -1)
+			{
+				Sleep(10);
+				call_events(E_TIMEOUTCHANGE, (LPVOID)(GetTickCount() - tms));
+			}
+		}
+		// ftpunlock();
+		if (ss < 0)
+		{
+			err = WSAGetLastError();
+			// deb("rln: ss recv : %d err:%d", ss, err);
+		}
+		// deb("r: %c (%x)",*bp,*bp);
+		tms = GetTickCount() - tms;
+		lastdelay = tms;
+		// if (maxms)
+		// ftpblocking(true);
+		// deb(ftprlhist);
+		// OutputDebugString("> %s", buf);
+		char dss[1024];
+		sprintf(dss, "%s, rln(sign=%s,maxms=%lu) totr:%d in %u ms, *bp=%x, ss=%d, err:%d| %s", ftprlhist,
+			sign, (unsigned long)maxms, totr, tms, *bp, ss, err, buf);
+		OutputDebugString(dss);
+		if (totr && tms && tms > timeoutst)
+		{
+			timeoutst = (DWORD)(floor((double)tms * 1.9));
+			// ftpdeb(" %%+ packet delay %lu ms", timeoutst);
+			// call_events(E_TIMEOUTCHANGE, (LPVOID)timeoutst);
+		}
+		else if (totr && tms && tms < timeoutst)
+		{
+			timeoutst = (DWORD)(floor((double)tms * 1.9));
+			// ftpdeb(" %%- packet delay %lu ms", timeoutst);
+			// call_events(E_TIMEOUTCHANGE, (LPVOID)timeoutst);
+		}
+		if (tms <= 0)
+		{
+			timeoutst = 1000;
+
+		}
+		call_events(E_TIMEOUTCHANGE, (LPVOID)timeoutst);
+		char *p;
+		if (totr && // buf[0] == '2' && buf[1] == '2' && buf[2] == '7' //&&
+			(p = strstr(buf, "227 Entering Passive")))
+		{
+			// deb("227 string ");
+			char portaddr[255];
+			sscanf(p, "%*s %*s %*s %*s %s", portaddr);
+			// deb("portaddr '%s'", portaddr);
+			unsigned long port1, port2;
+			int ip1, ip2, ip3, ip4;
+			sscanf(portaddr + 1, "%d,%d,%d,%d,%d,%d", &ip1, &ip2, &ip3, &ip4, &port1, &port2);
+			sprintf(ftphost, "%d.%d.%d.%d", ip1, ip2, ip3, ip4);
+			unsigned long port3 = port1 * 256 + port2;
+			ftpport = (int)port3;
+			// deb("port addr %s:%d", ftphost, ftpport);
+		}
+
+		if (totr && aborted)
+		{
+			// if (strstr(buf, "500 "))
+			// {
+			// deb("turned OFF ABOR OOB use.");
+			// aboruseoob = false;
+			// }
+			// else
+			// {
+			// deb("turned ON ABOR OOB use.");
+			// aboruseoob = true;
+			// }
+		}
+		aborted = false;
+
+		strncpy(lastftprep, buf, sizeof(lastftprep));
+		ftime = GetTickCount() - ftime;
+		ftpcontroltime += ftime;
+		if (totr)
+		{
+
+			deb(E_DEVMSG, "> %s", buf);
+			call_events(E_FTPREPLY, buf, (LPVOID)ftime, (LPVOID)func, (LPVOID)line);
+		}
+		call_events(E_FTPREADLINE, (LPVOID)buf, (LPVOID)ftime);
+		// deb("ftprl() ext");
+		// Form1->ftpent->Text = "";
+		ftpstate = -1;
+		// if (buf[0] == '5' && buf[1] == '3' && buf[2] == '0')
+		// ftpauth();
+		// Application->ProcessMessages();
+	}
+	catch(...)
+	{
+		deb("ftprl except");
+		ds;
+	}
+	return totr;
+}
+
+unsigned long ftppasvsave(char *host, int port, char *fn, char *buf, int bufsiz, unsigned long len,
+	unsigned long offset)
+{
+	char tb[22200];
+
+	DWORD ftime = GetTickCount();
+	breakpasvread = false;
+	deb(E_DEVMSG, "ftppasvsave(%s, %d, 0x%p, %d, %lu)", host, port, buf, bufsiz, len);
+	DWORD ms = GetTickCount();
+
+	if (ftphasdata())
+	{
+		ftprl(tb, timeoutst, 0);
+		gotopen = true;
+	}
+
+	if (!ftppasvconnect(host, port))
+		return -1;
+
+	if (!gotopen && ftphasdata())
+	{
+		ftprl(tb, timeoutst, 0);
+
+	}
+	gotopen = false;
+	ms = GetTickCount() - ms;
+
+	ftpstate = 2;
+
+	int ss = 0;
+	char *ptr = buf;
+	bool cont = true;
+	int readleft = len ? len : bufsiz;
+	if (!len && !bufsiz)
+	{
+		readleft = 16384;
+		cont = true;
+	}
+	bool exact = false;
+	if (len == (unsigned long)bufsiz && len)
+		exact = true;
+	unsigned long readok = 0;
+	DWORD tms = GetTickCount();
+	int numr = 0;
+	char tempbuf[8192];
+	bool tempreading = false;
+
+	DWORD ltms = 0;
+	// ftppsvblocking(false);
+	DWORD lastinms = timeoutst;
+	// deb("passive start recv @ %p", ptr);
+
+	int lastreadok = 0;
+	unsigned long numrecvs = 0;
+	unsigned long ptrsiz;
+	if (buf)
+	{
+		ptrsiz = (unsigned long)HeapSize(GetProcessHeap(), 0, ptr);
+		// deb("passive read block size %lu (%p), blocksize=%lu", ptrsiz, ptr, cacheblocks);
+	}
+	unsigned long sleeps = 0;
+	int err = 0;
+	char ff[255] = "";
+	DWORD lastetime = 0, lasterrtime = 0;
+	lastetime = GetTickCount();
+	HANDLE hwritefile = INVALID_HANDLE_VALUE;
+	// deb("passive sending start");
+	DWORD lastsstime = GetTickCount();
+	ftppsvblocking(true);
+	while (true)
+	{
+		if (breakpasvread && readok >= 256000)
+		{
+			deb(E_DEVMSG, "    send breaking due to breakpasvread: readok: %lu", readok);
+			break;
+		}
+
+		ftpstate = 4;
+		DWORD tms2 = GetTickCount();
+
+		if (unmounting)
+			return readok;
+
+		try
+		{
+//			unsigned long readsize;
+//			// readsize = cacheblocks ? cacheblocks : 131072; // (cacheblocks > readleft ? cacheblocks : readleft) :
+//			readsize = len > sockets_buffers ? sockets_buffers : len;
+//			if (!sockets_buffers)
+//				readsize = 65535;
+			// (readleft > 131072 ? 131072 : readleft);
+			// deb(E_FTPCONTROL, "execing recv(%d, %p, %lu, 0)", tempsock, ptr, readleft);
+			if (buf && IsBadWritePtr(ptr, readleft))
+			{
+				deb(E_FTPCONTROL, "bad write ptr pasv send @ %p", ptr);
+				deb("%p bufsize = %u, len = %lu", buf, HeapSize(GetProcessHeap(), 0, buf), len);
+				ds;
+			}
+			if (!buf)
+			{
+
+				if (hwritefile == INVALID_HANDLE_VALUE)
+				{
+
+					sprintf(ff, "storage\\%s", fn);
+					if (!FileExists(ff))
+					{
+						deb(E_DEVMSG, "no %s exists, using data.unk %lu", ff, savefilesize(0));
+						strcpy(ff, "data.unk");
+					}
+
+					if ((hwritefile = CreateFile(ff, GENERIC_READ, 0, 0, OPEN_EXISTING,
+								FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, 0))
+						== INVALID_HANDLE_VALUE)
+					{
+						deb(E_DEVMSG, "psvsave %lu  createfile (%s) %s", len, ff, fmterr());
+						ftpabor();
+						break;
+						// Sleep(100);
+						// break;
+					}
+					DWORD fs = GetFileSize(hwritefile, 0);
+					if (!len)
+						len = (unsigned long)fs;
+					 deb(E_DEVMSG, "%s file size %lu", ff, (unsigned long)fs);
+
+					DWORD ret = SetFilePointer(hwritefile, 0, NULL, FILE_BEGIN);
+					if (ret == INVALID_SET_FILE_POINTER)
+					{
+						deb("SetFilePointer: %s", fmterr());
+						break;
+					}
+
+				}
+				unsigned long readnum = 256000;
+
+				char fbuf[256000];
+				DWORD dwRead = 0;
+				readnum = readleft > 256000 ? 256000 : readleft;
+				// deb("execyting ReadFile(%x, %p, %lu, %p, 0)", h, nbuf, len, &dwRead);
+				if (!ReadFile(hwritefile, fbuf, readnum, &dwRead, 0))
+				{
+					deb("readfile: %s", fmterr());
+					break;
+				}
+
+				if (readnum != dwRead)
+				{
+					// deb(" readfile %x = %lu of %lu", hwritefile, dwRead, readnum);
+					//
+				}
+
+				if (!dwRead)
+				{
+					// deb(E_DEVMSG, "  no more data '%s' ", ff);
+					ss = 0;
+					// break;
+				}
+				else
+				{
+					ss = send(tempsock, (char*)fbuf, dwRead, 0);
+				}
+
+				if (ss > 0)
+					call_events(E_PASVREAD, (LPVOID)readok, (LPVOID)len, (LPVOID)bufsiz);
+				if (readok >= len || ss == 0)
+				{
+					// deb("break pasv send @ %lu, another data garbage", readok);
+					break;
+				}
+			}
+			else
+			{
+				ss = send(tempsock, (char*)ptr, readleft, 0);
+			}
+
+			unsigned long ofs;
+			ofs = offset + readok;
+			if (ss >= 256000)
+				deb(E_FTPCONTROL, "   send(%8lu / %8lu) [%s:%-8lu] %5d ms", readok, len, buf ? fn : ff, ofs,
+				(GetTickCount() - tms));
+
+			lasterrtime = GetTickCount();
+			err = WSAGetLastError();
+
+			// if (ss == -1)
+			// Sleep(1);
+
+		}
+		catch(Exception & e)
+		{
+			char sss[1111];
+			deunicode(e.Message.c_str(), sss, sizeof(sss));
+			fdeb("send except %s", sss);
+			exp;
+		}
+		// ftppsvblocking(false);
+		numrecvs++;
+
+		if (ss == 0)
+		{
+
+			deb("break pasv send (ss=0) @ %lu", readok);
+			// Sleep(10);
+			break;
+			// continue;
+		}
+
+		if (ss < 0)
+		{
+			// err = WSAGetLastError();
+			if (err == 10035)
+			{
+				// Sleep(100);
+				// sleeps += 100;
+			}
+			else if (err == 10053 && exact && readok < len)
+			{
+				call_events(E_PASVDISCONNECT, (LPVOID)host, (LPVOID)ftpport,
+					(LPVOID)(GetTickCount() - ftime), (LPVOID)readok);
+				deb(E_FTPCONTROL,
+					"send()=%s\r\nlost pasv connection @ byte %lu\r\nreconnecting %s:%d [max %lu ms]...",
+					fmterr(err), readok, host, port, pasvsockconntimeout);
+				if (ftphasdata())
+					ftprl(tb, timeoutst, 0);
+
+				// if (!ftppasvconnect(host, port))
+				{
+					deb("unsuccessful reconect");
+					break;
+				}
+			}
+			else
+			{
+				if (err)
+					deb("send ss: %d, exact %d readok %lu recv: %d %s", ss, exact, readok, err, fmterr(err));
+				// Sleep(timeoutst);
+				// deb("ss %d err %d", ss, err);
+				// if (err)
+				break;
+			}
+		}
+
+		if (GetTickCount() - tms2 > 0)
+			lastdelay = GetTickCount() - tms2;
+
+		int done;
+		if (ss > 0)
+		{
+			// if (!gotopen && ss > 0)
+			// {
+			// if (ftphasdata())
+			// {
+			// ftprl(tb, timeoutst, 0);
+			// gotopen = true;
+			// }
+			// // call_events(E_TIMEOUTCHANGE, (LPVOID)ms);
+			// }
+
+			ltms = GetTickCount();
+			lastpasvread = ss;
+
+			// if (readok - lastreadok >= clstsize / 2)
+			if ((GetTickCount() - lastetime >= 150) && ss > 0)
+			{
+				call_events(E_PASVREAD, (LPVOID)readok, (LPVOID)len, (LPVOID)bufsiz);
+				// call_events(E_TIMEOUTCHANGE, (LPVOID)(GetTickCount() - lastetime));
+				lastetime = GetTickCount();
+				lastreadok = readok;
+
+				// deb("  recv() = %d readok:%lu -- %lu", ss, readok, GetTickCount() - tms);
+			}
+
+			readok += ss;
+			numr = 0;
+
+			ptr = ptr + ss;
+
+			if (ss > 1)
+			{
+				ilastlen = (double)ss;
+				ibytesin += (double)ss;
+			}
+		}
+
+		if ((readleft - ss) >= 0 && ss > 0)
+			readleft -= ss;
+
+		if (exact && readok >= len)
+		{
+			if (ss == 0)
+			{
+				deb("send exact %lu bytes, ss %d (%s)", readok, ss, err, fmterr(err));
+				break;
+			}
+			else
+			{
+				// deb("waiting 0, ss %d, err %d %s", ss, err, fmterr(err));
+			}
+			// ftpabor();
+			// break;
+		}
+
+		if (ss <= 0 && GetTickCount() - lastsstime >= 8000)
+		{
+			call_events(E_TIMEOUT, (LPVOID)__FILE__, (LPVOID)__LINE__, (LPVOID)"maxpasv reach 8 sec");
+
+			deb(E_FTPCONTROL, "no psv data err: %d ss %d %s readok %lu", err, ss, fmterr(err), readok);
+			// ftpabor();
+			break;
+		}
+		else
+		{
+			if (ss > 0)
+				lastsstime = GetTickCount();
+		}
+		if (buf && ptrsiz && readok > ptrsiz)
+		{
+			deb("readok pasv send buf overflow: readed %lu, buffer only %lu", readok, ptrsiz);
+			ds;
+		}
+	}
+
+	if (ss > 0)
+	{
+		lastreadok = readok;
+	}
+
+	if (!buf && hwritefile)
+	{
+		CloseHandle(hwritefile);
+	}
+
+	send(tempsock, 0, 0, 0);
+	// shutdown(tempsock, SD_RECEIVE);
+	// ftpabor();
+	shutdown(tempsock, SD_SEND);
+
+	// deb("closesocket(%d) %s", tempsock, fmterr(WSAGetLastError()));
+
+	tempsock = 0;
+
+	call_events(E_PASVREAD, (LPVOID)readok, (LPVOID)len, (LPVOID)bufsiz);
+	call_events(E_PASVDISCONNECT, (LPVOID)host, (LPVOID)ftpport, (LPVOID)(GetTickCount() - ftime),
+		(LPVOID)readok);
+
+	DWORD gt = GetTickCount();
+
+	while (!gotopen || (!strstr(tb, "226 ") && !strstr(tb, "426 ") && !strstr(tb, "150 ")))
+	{
+		// deb("waiting send result %d ...", GetTickCount() - gt);
+		// Sleep(50);
+		// if (ftphasdata())
+		ftprl(tb, timeoutst, 0);
+		if (strstr(tb, "26 "))
+			gotopen = true;
+
+	}
+	closesocket(tempsock);
+
+	tms = GetTickCount() - tms;
+	ftpstate = -1;
+	ftime = GetTickCount() - ftime;
+	ftpdatatime += ftime;
+
+	if (ftphasdata())
+		ftprl(tb, timeoutst, 0);
+
+	deb(E_DEVMSG, "ftppasvsave() = sent %d from %s, numr: %lu ss %d, %lu мс, numsends: %lu,sleeps:%lu",
+		readok, ff, numr, ss, ftime, numrecvs, sleeps);
+
+	return readok;
+}
+
+void ftpabor(void)
+{
+	static SOCKET lastftpsock = 0;
+
+	char tb1[1024];
+	char abor1[1211];
+	char buff1[30];
+
+	if (lastftpsock != FtpSocket)
+	{
+		lastftpsock = FtpSocket;
+		notcheckedabor = true;
+		// aboruseoob = true;
+	}
+
+	ftpblocking(false);
+	// ftplock();
+	if (aboruseoob)
+	{
+		buff1[0] = 0xff;
+		buff1[1] = 0xf4;
+		// buff1[2] = 0xff;
+		buff1[2] = 0xf2;
+		send(FtpSocket, buff1, 3, MSG_OOB);
+	}
+
+	ftpcmd("ABOR\r\n", 0, 0);
+
+	aborted = true;
+
+	if (ftphasdata())
+	{
+		memset(tb1, 0, sizeof(tb1));
+		while (ftphasdata())
+		{
+			ftprl(tb1, timeoutst, 0);
+			if (strstr(tb1, "500 "))
+			{
+				aboruseoob = false;
+				deb("turned off oob using in ABOR");
+			}
+
+		}
+	}
+}
+
+int _ftpcmd(char *func, int line, char *cmd, char *obuf = 0, int len = 0)
+{
+	char buf[2048];
+	ftpstate = 1;
+	DWORD ftime = GetTickCount();
+	// Application->ProcessMessages();
+	sprintf(lastftpcmd, "%s", cmd);
+	sprintf(ftpcmdhist, "%15s->ftpcmd(%s):%5d", func, cmd, line);
+	// if (Form1->debcheck->Checked)
+	// ftplock();
+	// ftpdeb(" # %s", cmd);
+	if (!FtpSocket)
+		if (!ftpconn(true))
+		{
+			ftpstate = -1;
+			return -1;
+		}
+
+	ftpstate = 1;
+
+	while (ftphasdata())
+	{
+		ftprl(buf, timeoutst, 0);
+		Sleep(timeoutst);
+	}
+
+	ftpblocking(true);
+	int canread;
+
+	if (!strstr(lastftpcmd, "\r"))
+	{
+		strcat(lastftpcmd, "\r");
+	}
+	if (!strstr(lastftpcmd, "\n"))
+	{
+		strcat(lastftpcmd, "\n");
+	}
+	int ss;
+	int flags = 0;
+	int sd = send(FtpSocket, (char*)lastftpcmd, strlen(lastftpcmd), flags);
+	int err = WSAGetLastError();
+	// ftpblocking(false);
+	// ftpunlock();
+	char blaaa[1111];
+	deb(E_DEVMSG, "# %s", lastftpcmd);
+	ftpstate = -1;
+	ftime = GetTickCount() - ftime;
+	OutputDebugString(cmd);
+	call_events(E_FTPCMD, lastftpcmd, (LPVOID)ftime, (LPVOID)func, (LPVOID)line);
+	if (sd > 0)
+	{
+		olastlen = sd;
+		obytesin += sd;
+
+	}
+	else
+	{
+		deb("sd: %d: %s", sd, fmterr(err));
+		shutdown(FtpSocket, SD_BOTH);
+		closesocket(FtpSocket);
+		FtpSocket = 0;
+		ftpconn(true);
+		return sd;
+	}
+	// deb("lv");
+	ftpcontroltime += ftime;
+	return sd;
+}
+
+bool _ftptrylock(char *f, int line)
+{
+	bool xui = false;
+
+	// deb("_ftptrylock(%s, %d)", f, line);
+	if (!ftpcs)
+	{
+		deb("ftpcs = 0!");
+		return false;
+	}
+	// if (ftplockline != -1)
+	// deb("ftplockline %d", ftplockline);
+	if (ftpcs->TryEnter())
+	{
+		ftpcs_entered++;
+		xui = true;
+		ftplockline = line;
+
+		// deb("_ftptrylock locked %s:%d", f, line);
+		// call_events(E_LOCKED, (LPVOID)"_ftptrylock", (LPVOID)ftplockline, (LPVOID)ftpcs_entered);
+	}
+	else
+	{
+		// deb("_ftptrylock can't lock %x, locked @ %d", ftpcs, ftplockline);
+	}
+	// deb("xyu %d",xui);
+
+	return xui;
+}
+
+void _ftplock(char *func, int line)
+{
+	if (!ftpcs)
+		return;
+
+	sprintf(ftpcs_enteringat, "entering in %s():%3d", func, line);
+	// if (ftplockline)
+	// deb("ftplockline %d", ftplockline);
+
+	// if (ftpcs_entered < 0 || ftpcs_entered > 3)
+	// deb("_ftplock(%s,%d) ftpstate: %d ftpcs_entered: %d", func, line, ftpstate, ftpcs_entered);
+	int ss = ftpstate;
+	ftpstate = 33;
+	// call_events(E_LOCKING, (LPVOID)func, (LPVOID)line, (LPVOID)ftpcs_entered);
+	ftpcs->Enter();
+	ftplockline = line;
+	if (line)
+		sprintf(ftpcs_lockedat, "%s:%d", func, line);
+	ftpcs_entered++;
+	// call_events(E_LOCKED, (LPVOID)func, (LPVOID)line, (LPVOID)ftpcs_entered);
+	ftpstate = ss;
+	ftpcs_enteringat[0] = 0;
+}
+
+void _ftpunlock(char *func, int line)
+{
+	if (!ftpcs)
+		return;
+	// if (ftpcs_entered < 0 || ftpcs_entered > 3)
+	// deb("_ftpunlock(%s,%d) ftpstate: %d ftpcs_entered: %d", func, line, ftpstate, ftpcs_entered);
+	int ss = ftpstate;
+	ftpstate = 34;
+	// call_events(E_UNLOCKING, (LPVOID)func, (LPVOID)line, (LPVOID)ftpcs_entered);
+	ftpcs->Leave();
+	// ftplockline = -1;
+	ftpcs_entered--;
+	// call_events(E_UNLOCKED, (LPVOID)func, (LPVOID)line, (LPVOID)ftpcs_entered);
+	ftpstate = ss;
+
+}
+
+char *ftppwd(void)
+{
+
+	static char b[1024];
+	int code = 0;
+	bool done = false;
+	char *p = NULL;
+
+	if (!ftpdirchanged)
+	{
+		deb("ftppwd = %s", ftpretdir);
+		return ftpretdir;
+	}
+
+	// ftpdirchanged = false;
+	while (ftphasdata())
+	{
+		ftprl(b, timeoutst, 0);
+		Sleep(timeoutst);
+	}
+	ftpcmd("PWD", 0, 0);
+	ftprl(b, timeoutst, 0);
+	int i = 0;
+	static char bb[255] = "";
+	char *c;
+	c = strstr(b, "257");
+	if (c)
+		i = sscanf(c, "257 \"%[^\"]\"", bb);
+
+	// Sleep(50);
+	while (ftphasdata())
+	{
+		c = strstr(b, "257");
+		if (c)
+			i = sscanf(c, "257 \"%[^\"]\"", bb);
+		Sleep(timeoutst);
+	}
+
+	if (!i)
+		return "/";
+	else
+		strcpy(ftpretdir, bb);
+	deb("ftppwd = %s", bb);
+	return bb;
+}
+
+int _ftpcd(char *func, int line, char *dir)
+{
+	char b[2222] = "";
+	char *p = NULL;
+	char sdir[222];
+
+	strcpy(ftpretdir, ftppwd());
+	deb("%s:%d ftpcd(%s) in %s", func, line, dir, ftpretdir);
+
+	if (dir[0] == 0x20)
+		return -1;
+
+	memset(sdir, 0, sizeof(sdir));
+
+	if (dir[0] == '!')
+		sdir[0] = '/';
+
+	strcat(sdir, dir);
+
+	int code = -1;
+	bool done = false;
+
+	while (ftphasdata())
+	{
+		ftprl(b, timeoutst, 0);
+		Sleep(timeoutst);
+	}
+
+	char *next_token5 = NULL;
+	unsigned int i = 133;
+	char * d;
+	d = strtok_s(sdir, &i, "\\/", &next_token5);
+	int nt = 0;
+	if (d)
+	{
+		nt++;
+		deb("first tok %s", d);
+		sprintf(b, "CWD %s", d);
+		ftpcmd(b, 0, 0);
+		ftprl(b, timeoutst, 0);
+		code = atoi(b);
+
+		if (code == 250)
+		{
+			ftpdirchanged = true;
+
+		}
+
+		while ((d = strtok_s(NULL, &i, "\\/", &next_token5)))
+		{
+			deb("dir token #%d %s", nt, d);
+			nt++;
+			sprintf(b, "CWD %s", d);
+			ftpcmd(b, 0, 0);
+			ftprl(b, timeoutst, 0);
+			code = atoi(b);
+			if (code == 250)
+			{
+				ftpdirchanged = true;
+
+			}
+		}
+	}
+	else
+	{
+		sprintf(b, "CWD %s", sdir);
+		ftpcmd(b, 0, 0);
+		ftprl(b, timeoutst, 0);
+		code = atoi(b);
+		if (code == 250)
+		{
+			ftpdirchanged = true;
+
+		}
+	}
+
+	if (!code)
+		code = atoi(b);
+
+	if (code == 250 && nt >= 2)
+	{
+		ftpdirchanged = true;
+
+	}
+
+	deb("cd %s = %d", dir, code);
+
+	return code;
+}
+
+int ftpcwdret(void)
+{
+	deb("ftpcwdret (to %s)", ftpretdir);
+
+	char b[2222] = "";
+	char *p = NULL;
+	char sdir[222];
+
+	if (ftpretdir[0] == 0x20 || ftpretdir[1] == 0)
+	{
+		ftpretdir[0] = '/';
+		ftpretdir[1] = 0;
+	}
+
+	memset(sdir, 0, sizeof(sdir));
+
+	if (ftpretdir[0] == '!')
+		sdir[0] = '/';
+
+	strcat(sdir, ftpretdir);
+
+	int code = -1;
+	bool done = false;
+
+	// Sleep(timeoutst);
+	while (ftphasdata())
+	{
+		ftprl(b, timeoutst, 0);
+		Sleep(timeoutst);
+	}
+
+	char *next_token3 = NULL;
+	unsigned int i = 133;
+	char * d;
+	d = strtok_s(sdir, &i, "\\/", &next_token3);
+
+	if (d)
+	{
+		code = ftpcd(d);
+		if (code == 250)
+			strcpy(ftpretdir, ftppwd());
+		while ((d = strtok_s(NULL, &i, "\\/", &next_token3)))
+		{
+			code = ftpcd(d);
+			if (code == 250)
+				strcpy(ftpretdir, ftppwd());
+		}
+	}
+	else
+	{
+		code = ftpcd(sdir);
+		if (code == 250)
+			strcpy(ftpretdir, ftppwd());
+	}
+
+	// code = atoi(b);
+	// if (code == 250)
+	// strcpy(ftpretdir, ftppwd());
+	ftpdirchanged = true;
+	return code;
+}

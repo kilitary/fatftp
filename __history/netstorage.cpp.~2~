@@ -1,0 +1,265 @@
+#include "ff.h"
+#pragma hdrstop
+#include "vdskapi.h"
+#include "disk.h"
+#include "functions.h"
+#include <vector>
+
+using namespace std;
+
+extern bool unmounting;
+extern TCriticalSection *ecs;
+extern unsigned long rntrys;
+extern LONGLONG rlastoffset;
+extern unsigned long wntrys;
+extern LONGLONG wlastoffset;
+extern unsigned long pfat1, pfat2;
+extern LONGLONG fatsize;
+extern unsigned long rootdirectory;
+extern vector<FATFILE>files;
+extern vector<CACHE>cache;
+extern LONGLONG clstsize;
+extern FAT32BOOT fat32boot;
+extern DWORD ftpcontroltime, ftpdatatime;
+extern char ftpcurdir[128];
+extern bool ramdisk;
+extern double delayperc;
+extern LONGLONG curdisksize;
+extern LPVOID memory;
+extern int totreads, totwrites;
+extern double gt, bt;
+extern int numpkt;
+extern SOCKET ConnectSocket, FtpSocket;
+extern HANDLE hdisk;
+extern char drive_letter;
+extern LONGLONG disksize;
+
+
+unsigned long nread(unsigned long buf, unsigned long offset, unsigned long size, bool paged)
+{
+	// cev->SetEvent();
+	// deb("nread enter cchs");
+	cchs->Enter();
+	// deb("nread entered cchs");
+	if (!ConnectSocket)
+		nconn();
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.cmd = 0;
+	pkt.offset = offset;
+	pkt.size = size;
+	pkt.sign = 'A';
+	pkt.flags = 0;
+	if (paged)
+		pkt.flags |= 0x00000002;
+	if (precache)
+		pkt.flags |= 0x00000004;
+	DWORD dwSiz = 64;
+	GetComputerNameEx(ComputerNameDnsHostname, pkt.compid, &dwSiz);
+	dwSiz = 128 - strlen(pkt.compid);
+	GetComputerNameEx(ComputerNameNetBIOS, pkt.compid + strlen(pkt.compid), &dwSiz);
+	pkt.preverr = err;
+	pkt.crc = (unsigned long)checksum((unsigned short*)buf, size);
+	int ss = send(ConnectSocket, (char*) & pkt, sizeof(pkt), 0);
+	if (ss != sizeof(pkt))
+	{
+		err = WSAGetLastError();
+		deb("failed to send PACKET! sent only %d bytes err %d", ss, err);
+	}
+	unsigned long readok = 0, readleft = size;
+	unsigned long p = 0;
+	double pr;
+	int len;
+	char str[128];
+	int rds = 0;
+	while (readleft)
+	{
+		rds++;
+		p = (unsigned long)((unsigned long)buf + (unsigned long)readok);
+		long rn = readleft < 118000 ? readleft : 118000;
+		len = recv(ConnectSocket, (char*)p, rn, 0);
+		if (len > 0)
+		{
+			ibytesin += len;
+			if (ss > 1)
+				ilastlen = (double)len;
+		}
+		if (len != readleft)
+		{
+			err = WSAGetLastError();
+			pr = readok + len;
+			pr = (pr / size) * 100.0;
+			deb("   прочитано %5d из %-8lu %.2f%%", len, readleft, pr, err);
+			if (err)
+				deb(" err=%d:   %s", err, fmterr(err));
+			// Application->ProcessMessages();
+			if (len <= 0 || err)
+			{
+				ConnectSocket = 0;
+				cchs->Leave();
+				// deb("nread leaved cchs");
+				return readok;
+			}
+		}
+		readleft -= len;
+		readok += len;
+		sprintf(str, "%6d #%-4d %3.2f%%", len, rds, pr);
+		// Form1->readb->Text = str;
+		// Application->ProcessMessages();
+	}
+	int opt = 1;
+	setsockopt(ConnectSocket, SOL_SOCKET, SO_DONTLINGER, (char*) & opt, 1);
+	opt = 65535;
+	setsockopt(ConnectSocket, SOL_SOCKET, SO_RCVBUF, (char*) & opt, sizeof(opt));
+	setsockopt(ConnectSocket, SOL_SOCKET, SO_SNDBUF, (char*) & opt, sizeof(opt));
+	cchs->Leave();
+	// Form1->readb->Text = "-";
+	// Application->ProcessMessages();
+	// deb("nread leaved cchs");
+	return readok;
+}
+
+unsigned long nwrite(unsigned long buf, unsigned long offset, unsigned long size, bool paged, bool cachesave = false,
+	int flags = 0, char*addon = NULL)
+{
+	cchs->Enter();
+	// cev->SetEvent();
+	if (!ConnectSocket)
+		nconn();
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.cmd = 1;
+	pkt.offset = offset;
+	pkt.size = size;
+	pkt.sign = 'A';
+	pkt.flags = 0;
+	if (addon)
+		strncpy(pkt.preverrstr, addon, sizeof(pkt.preverrstr));
+	if (paged)
+		pkt.flags |= 0x00000002;
+	if (cachesave)
+		pkt.flags |= 0x00000008;
+	if (flags)
+		pkt.flags |= flags;
+	DWORD dwSiz = 64;
+	GetComputerNameEx(ComputerNameDnsHostname, pkt.compid, &dwSiz);
+	dwSiz = 128 - strlen(pkt.compid);
+	GetComputerNameEx(ComputerNameNetBIOS, pkt.compid + strlen(pkt.compid), &dwSiz);
+	pkt.preverr = err;
+	pkt.crc = (unsigned long)checksum((unsigned short*)buf, size);
+	int ss = send(ConnectSocket, (char*) & pkt, sizeof(pkt), 0);
+	if (ss != sizeof(pkt))
+	{
+		err = WSAGetLastError();
+		deb("failed to send PACKET! sent only %d bytes err %d", ss, err);
+		closesocket(ConnectSocket);
+		ConnectSocket = 0;
+		nconn();
+		cchs->Leave();
+		return -1;
+	}
+	ULONG writeok = 0, writeleft = size;
+	unsigned long p = 0;
+	while (writeleft)
+	{
+		p = (unsigned long)((unsigned long)buf + (unsigned long)writeok);
+		int len;
+		len = send(ConnectSocket, (char*)p, writeleft, 0);
+		if (len > 0)
+		{
+			obytesin += len;
+			olastlen = len;
+		}
+		err = WSAGetLastError();
+		if (len <= 0 || err)
+		{
+			// ConnectSocket=0;
+			cchs->Leave();
+			return 0;
+		}
+		if (len > writeleft)
+		{
+			nconn();
+			cchs->Leave();
+			return 0;
+		}
+		// nconn();
+		if (len != writeleft)
+		{
+			deb(" write just %d of %u,err=%d", len, writeleft, err);
+			if (err)
+				deb("   %s", fmterr(err));
+		}
+		writeleft -= len;
+		writeok += len;
+		char str[128];
+		sprintf(str, "%d", len);
+		// Form1->
+	}
+	cchs->Leave();
+	return writeok;
+}
+
+
+int nreadfile(char*fn, unsigned long start_offset, int len, char*buf)
+{
+	PKT pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.sign = 'A';
+	pkt.cmd = 7;
+	strcpy(pkt.preverrstr, fn);
+	pkt.offset = (unsigned long)start_offset;
+	pkt.size = (unsigned long)len;
+	cchs->Enter();
+	if (!ConnectSocket)
+	{
+		deb("socket is not connected!");
+		if (!nconn())
+		{
+			deb("failed to connect");
+			cchs->Leave();
+			return -1;
+		}
+	}
+	LARGE_INTEGER xyu;
+	int nrecv = -1;
+	int nsend = send(ConnectSocket, (char*) & pkt, sizeof(pkt), 0);
+	if (nsend < 0)
+	{
+		deb("send only %d bytes of file reqyest %s", nsend, fn);
+		shutdown(ConnectSocket, SD_BOTH);
+		closesocket(ConnectSocket);
+		ConnectSocket = NULL;
+		nconn();
+		int nsend = send(ConnectSocket, (char*) & pkt, sizeof(pkt), 0);
+		if (nsend != sizeof(PKT))
+		{
+			deb("failed to restore connection.");
+			cchs->Leave();
+			return nsend;
+		}
+	}
+	else
+	{
+		obytesin += nsend;
+		olastlen = nsend;
+		xyu.QuadPart = start_offset;
+		// paintdisk(1, xyu, len, false, 0);
+	}
+	nrecv = recv(ConnectSocket, buf, len, 0);
+	if (nrecv < 0)
+	{
+		deb("recieved only %d bytes of file %s", nrecv, fn);
+		shutdown(ConnectSocket, SD_BOTH);
+		closesocket(ConnectSocket);
+		ConnectSocket = NULL;
+		// nconn();
+	}
+	else
+	{
+		ibytesin += nrecv;
+		if (nrecv > 1)
+			ilastlen = (double)nrecv;
+	}
+	// paintdisk(4, xyu, len, false, 0);
+	cchs->Leave();
+	return nrecv;
+}

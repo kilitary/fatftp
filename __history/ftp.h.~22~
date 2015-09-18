@@ -1,0 +1,28 @@
+#include "ff.h"
+
+#define ftplock()   _ftplock(__FUNC__,__LINE__)
+#define ftpunlock() _ftpunlock(__FUNC__,__LINE__)
+#define ftptrylock() _ftptrylock(__FUNC__,__LINE__)
+
+#define ftprl(buf,tim, sign) _ftprl(__FUNC__,__LINE__, buf, (DWORD) tim, sign)
+#define ftpcmd(cmd, inbuf, inbufsiz) _ftpcmd(__FUNC__,__LINE__,cmd,inbuf,inbufsiz)
+
+#define ftpcd(dir)  _ftpcd(__FUNC__, __LINE__, dir)
+
+bool ftphasdata(bool wait);
+void ftppsvblocking(bool block);
+bool ftpconn(bool quick = false);
+int _ftprl(char*func, int line, char*buf, DWORD maxms, char*sign);
+int _ftpcmd(char*func, int line, char*cmd, char*obuf, int len);
+int _ftpcd(char*dir);
+int ftpcwdret(void);
+bool _ftptrylock(char*f, int line);
+char *ftppwd(void);
+void _ftplock(char*func, int line);
+void _ftpunlock(char*func, int line);
+void ftpabor(void);
+void ftpblocking(bool block);
+unsigned long ftppasvread(char*host, int port, char*buf, int bufsiz, unsigned long len, char*dosfn,
+	unsigned long cacheblocks, unsigned long startoffset);
+unsigned long ftpsavefile(char*ftpdir, char*fn, char*buf, unsigned long len, unsigned long offset);
+unsigned long ftppasvsave(char*host, int port, char*buf, int bufsiz, unsigned long len);

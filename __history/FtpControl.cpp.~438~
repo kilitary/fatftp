@@ -1,0 +1,369 @@
+// ---------------------------------------------------------------------------
+
+#include <vcl.h>
+
+#include "ff.h"
+
+#include "vdskapi.h"
+#include "disk.h"
+#include "functions.h"
+#include "extern.h"
+#include <vector>
+#include "ftp.h"
+#include "netfiles.h"
+#include "cache.h"
+
+#include "FtpControl.h"
+#pragma hdrstop
+// #pragma package(smart_init)
+// #pragma hdrstop
+extern bool processing_disk_event;
+
+char nowcachingdosfn[255] = "";
+extern DWORD lastdisktime;
+
+#define cfdeb(...) deb(E_CACHEMSG, __VA_ARGS__)
+
+__fastcall FtpControl::FtpControl(bool CreateSuspended) : TThread(CreateSuspended)
+{
+}
+
+// ---------------------------------------------------------------------------
+void __fastcall FtpControl::Execute()
+{
+	DWORD nopwait = 0;
+	DWORD nopcmdtm = GetTickCount();
+	DWORD secondtm = GetTickCount();
+	NameThreadForDebugging("FtpControl");
+
+	deb(E_FTPCONTROL, "FtpControl thread %x", GetCurrentThreadId());
+
+	Priority = tpIdle;
+
+	while (true)
+	{
+		Sleep(40);
+
+		if (GetTickCount() - secondtm >= 1000)
+		{
+			secondtm = GetTickCount();
+			call_events(E_SECOND, (LPVOID)rand());
+		}
+		//
+		// if (GetTickCount() - nopcmdtm >= nopwait)
+		// {
+		// nopwait = 23400 + (rand() % 13400);
+		//
+		// if (!FtpSocket || processing_disk_event)
+		// continue;
+		//
+		// char *cmds[] =
+		// {
+		// "NOp", "fEAT", "NooP", "STAT", "HELP", "TYPE", "SYST", "PWD"
+		// };
+		//
+		// int num = rand() % 8;
+		//
+		// ftplock();
+		//
+		// ftpcmd(cmds[num], 0, 0);
+		//
+		// char b[11111];
+		// ftprl(b, timeoutst, 0);
+		//
+		// while (ftphasdata())
+		// ftprl(b, timeoutst, 0);
+		//
+		// ftpunlock();
+		//
+		// // ftpunlock();
+		//
+		// nopcmdtm = GetTickCount();
+		// }
+
+		if (!ccs)
+			continue;
+
+		for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+		{
+
+			if (GetTickCount() - (*it).lastaccessed >= 10000)
+			{
+				try
+				{
+					if ((SIZE_T)HeapSize(GetProcessHeap(), 0, (*it).buf) != (SIZE_T) - 1)
+					{
+						// fdeb(E_CACHEMSG, "cache: freeing %7lu bytes (%7lu in records) of '%s' @ %08X",
+						// HeapSize(GetProcessHeap(), 0, (*it).buf), (*it).size, (*it).fn, (*it).buf);
+
+						int numcaches = ((int)cache.size()) - 1;
+						unsigned long heapsiz;
+						heapsiz = (unsigned long)HeapSize(GetProcessHeap(), 0, (*it).buf);
+						ccs->Enter();
+						HeapFree(GetProcessHeap(), 0, (*it).buf);
+						it = cache.erase(it);
+
+						call_events(E_CACHEFREED, (LPVOID)(*it).buf, (LPVOID)(*it).fn, (LPVOID)heapsiz,
+							(LPVOID)(*it).offset, (LPVOID)numcaches);
+						ccs->Leave();
+						if (it == cache.end())
+							break;
+					}
+					else
+					{
+						deb(E_CACHEMSG, "cache block @ %p for '%s' size: %lu is not heap allocated!",
+							(*it).buf, (*it).fn, (*it).size);
+					}
+				}
+				catch(...)
+				{
+					exp;
+				}
+			}
+			//
+			// // decrease blocks
+			// unsigned long maxcachebufsize = precacheminbytes; // 8 * 1024 * 1024;
+			// if ((*it).bufsize > maxcachebufsize)
+			// {
+			// unsigned long newsiz = maxcachebufsize - 512000;
+			// memcpy((*it).buf, (void*)((unsigned long)(*it).buf + (unsigned long)(*it).size -
+			// (unsigned long)maxcachebufsize), newsiz);
+			//
+			// (*it).buf = HeapReAlloc(GetProcessHeap(), 0, (*it).buf, newsiz);
+			// cache_list();
+			// deb(E_CACHEMSG, "cache block %p truncated from %lu to %lu", (*it).buf, (*it).bufsize,
+			// newsiz);
+			//
+			//
+			// (*it).offset += ((*it).bufsize - newsiz);
+			// if (!(*it).buf)
+			// ds;
+			// (*it).size = newsiz;
+			// (*it).bufsize = newsiz;
+			// }
+
+		}
+
+		// cfdeb("check for cache");
+
+		// files_sort_diskevent();
+
+		// filescs->Enter();
+		int seqreads;
+		seqreads = cache_seq_reads();
+
+		for (vector<FATFILE>::iterator it = files.begin(); it != files.end(); it++)
+		{
+			if (GetTickCount() - lastdisktime >= 700 && (*it).unsaved && GetTickCount() - (*it)
+				.lastaccessed >= 1000)
+			{
+				(*it).nowwriting = false;
+
+				if (!savefilesize((*it).fn) && !writtenlen)
+				{
+					(*it).lastaccessed = GetTickCount();
+					deb(E_FTPCONTROL, "waiting storage [%13s]: unsavedlen %7lu writtenlen %7lu", (*it).fn,
+						(*it).unsavedlen, writtenlen);
+					continue;
+				}
+				deb(E_CACHEMSG, "saving %13s [storage:%8lu / unsvd:%7lu / written:%7lu] fsize %lu", (*it).fn,
+					savefilesize((*it).fn), (*it).unsavedlen, writtenlen, (unsigned long)(*it).size);
+
+				if ((*it).unsavedlen > (unsigned long)(*it).size)
+					(*it).unsavedlen = (unsigned long)(*it).size;
+				ftplock();
+				unsigned long rrr = ftpsavefile((*it).ftppath, (*it).fn, (char*)0, (*it).unsavedlen, 0);
+				ftpunlock();
+
+				if (rrr)
+				{
+					deb(E_FTPCONTROL, "psvsave %s %lu = %lu", (*it).fn, (*it).unsavedlen, rrr);
+					(*it).unsaved = 0;
+					(*it).unsavedlen = 0;
+					char fnn[255];
+
+					sprintf(fnn, "storage\\%s", (*it).fn);
+					DeleteFile(fnn);
+
+				}
+				else
+				{
+					deb(E_DEVMSG, "waiting write data %s", (*it).fn);
+				}
+
+				break;
+
+			}
+
+			if (GetTickCount() - (*it).lastaccessed >= 8000)
+			{
+				(*it).sequential_reads = 0;
+				(*it).nowcaching = false;
+
+			}
+
+			if (GetTickCount() - (*it).lastdisktime <= 5500)
+			{
+				// fdeb("checking %s", (*it).fn);
+				unsigned long precachesize = 0;
+				unsigned long readoffset = 0;
+				unsigned long flen = 0;
+
+				unsigned long stofs = 0; // (*it).lastoffset + (*it).lastlen;
+
+				if (stofs <= 131072)
+					stofs = 0;
+				// deb("nextcachelen=%lu", (*it).nextcachelen);
+				flen = (*it).nextcachelen;
+				if (!flen)
+					flen = precacheminbytes;
+				if (!flen)
+					flen = 512000;
+
+				if (!(*it).sequential_reads)
+				{
+					// deb(E_CACHEMSG, "no seq reads", (*it).lastlen * 10,
+					// stofs - (*it).lastoffset + (*it).lastlen);
+					// deb(E_CACHEMSG, "%s skip no sequential_reads", (*it).fn);
+					// (*it).nowcaching = false;
+					(*it).nowcaching = false;
+					continue;
+
+				}
+				else
+				{
+					// fdeb(E_CACHEMSG, "sequential_reads %lu, cache %lu @ %lu", (*it).sequential_reads,
+					// (*it).nextcachelen, (*it).nextcacheoffset);
+
+					if (in_cache((*it).fn, (*it).lastoffset, (*it).nextcachelen / 4))
+					{
+						//deb(E_CACHEMSG, "%s skip precache, %lu bytes @ %8lu", (*it).fn,
+						  //	(*it).nextcachelen / 4, (*it).lastoffset);
+						(*it).nowcaching = false;
+						continue;
+					}
+				}
+
+				if ((*it).nextcacheoffset >= (*it).size )
+				{
+					deb(E_CACHEMSG, "%s skip precache, nextcacheoffset %lu, nextcachelen %lu, size %lu", (*it).fn,
+						(*it).nextcacheoffset, (*it).nextcachelen, (*it).size);
+					(*it).nowcaching = false;
+					(*it).sequential_reads = 0;
+					continue;
+				}
+				if ((*it).nextcacheoffset + (*it).nextcachelen >= (*it).size)
+					(*it).nextcachelen = (*it).size - (*it).nextcacheoffset;
+
+				(*it).nextcacheoffset = (*it).lastoffset + (*it).lastlen;
+				// fdeb(E_CACHEMSG, "seqcacheoffset %lu", stofs);
+				stofs = (*it).nextcacheoffset;
+
+				if (in_cache((*it).fn, stofs, flen))
+				{
+					deb(E_CACHEMSG, "%s skip precache: %lu bytes @ %8lu", (*it).fn, flen, stofs);
+					(*it).nowcaching = false;
+					(*it).sequential_reads = 0;
+					continue;
+				}
+				deb(E_CACHEMSG, "precaching %lu '%s' @ %lu  ", flen, (*it).fn, stofs);
+				(*it).nowcaching = true;
+
+				(*it).nowcachingoffset = stofs;
+				(*it).nowcachinglen = flen;
+				strcpy(nowcachingdosfn, (*it).dosfn);
+
+				ftplock();
+
+				char curdir[255];
+				int code = 250;
+				strncpy(curdir, ftpcurdir, sizeof(curdir));
+				// fdeb("allocating %lu bytes", flen);
+				char *buf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, flen);
+				// fdeb("flen %lu, buf @ %p %lu", flen, buf, HeapSize(GetProcessHeap(), 0, buf));
+				// ftpcs->Enter();
+				// fdeb("
+
+				if (strcmpi((*it).ftppath, ftpcurdir) != 0)
+				{
+
+					ftpcd("/");
+					code = 250;
+
+					if (strlen((*it).ftppath))
+						code = ftpcd((*it).ftppath);
+
+					if (code != 250)
+					{
+						ftpcd("/");
+						// ecs->Leave();
+						// processing_disk_event = false;
+						// ftpcs->Leave();
+						ftpunlock();
+						continue;
+					}
+
+					strcpy(ftpcurdir, (*it).ftppath);
+				}
+
+				call_events(E_STARTPRECACHE, (LPVOID)(*it).fn, (LPVOID)flen, (LPVOID)stofs);
+
+				fdeb("ftpgetfile(%-15s, %8lu, %8p, %8lu)", (*it).fn, (unsigned long)stofs, buf,
+					(unsigned long)flen);
+
+				call_events(E_FTPPREGETFILE, (LPVOID)(*it).ftppath, (LPVOID)(*it).fn, (LPVOID)stofs,
+					(LPVOID)buf, (LPVOID)flen);
+
+				DWORD ftpgettm = GetTickCount();
+
+				unsigned long nrd = ftpgetfile((*it).fn, (unsigned long)stofs, (char*)buf, flen, (*it).dosfn,
+					256000, stofs);
+
+				ftpunlock(); // ftpcs->Leave();
+				(*it).nowcaching = false;
+				HeapFree(GetProcessHeap(), 0, buf);
+
+				ftpgettm = GetTickCount() - ftpgettm;
+
+				// fdeb(E_CACHEMSG, "precacheclstrs [%lu]", (*it).precacheclstrs);
+				fdeb("ftpgetfile(%-15s, %8lu, %8p, %8lu) = %lu", (*it).fn, (unsigned long)stofs, buf,
+					(unsigned long)flen, nrd);
+
+				call_events(E_FTPGETFILE, (LPVOID)(*it).fn, (LPVOID)stofs, (LPVOID)buf, (LPVOID)flen,
+					(LPVOID)ftpcontroltime, (LPVOID)ftpdatatime, (LPVOID)nrd);
+
+				(*it).lastcacheoffset = stofs;
+
+				if (nrd > 0)
+				{
+					// cache_save((*it).ftppath, (*it).dosfn, ((unsigned long)stofs), nrd, buf);
+
+					(*it).nextcacheoffset = stofs + nrd;
+					(*it).lastcachelen = nrd;
+
+					// (*it).lastoffset = stofs;
+
+				}
+				else
+				{
+					(*it).sequential_reads = 0;
+					(*it).lastcachelen = 0;
+					fdeb("zero download %lu @ %lu fsize %lu!", flen, stofs, (*it).size);
+					// ds;
+				}
+
+				(*it).nowcachingoffset = stofs;
+				(*it).nowcachinglen = (*it).nextcachelen * 2;
+
+				nopcmdtm = GetTickCount();
+
+				cache_list();
+				break;
+			}
+
+		}
+		// filescs->Leave();
+
+	}
+}
+// ---------------------------------------------------------------------------

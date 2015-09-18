@@ -1,0 +1,391 @@
+#include "ff.h"
+
+#include "vdskapi.h"
+#include "disk.h"
+#include "functions.h"
+#include "extern.h"
+#include <vector>
+#pragma hdrstop
+using namespace std;
+
+unsigned long highcacheoffset(char *fn)
+{
+	unsigned long bestoffset = 0;
+
+	ccs->Enter();
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		if (strncmpi(fn, (*it).fn, 13) == 0 && bestoffset < (*it).offset + (*it).size)
+		{
+			bestoffset = (*it).offset + (*it).size;
+		}
+	}
+	ccs->Leave();
+	return bestoffset;
+}
+
+unsigned long nextcacheoffset(char *fn, unsigned long offset)
+{
+	ccs->Enter();
+	unsigned long nextoffset = 0;
+	bool found = false;
+
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		if (strncmpi(fn, (*it).fn, 13) == 0 && offset >= (*it).offset && offset <= (*it).offset + (*it).size)
+		{
+			nextoffset = (*it).offset + (*it).size;
+			found = true;
+			(*it).lastaccessed = GetTickCount();
+		}
+	}
+
+	ccs->Leave();
+
+	if (!found)
+	{
+		deb(E_FTPCONTROL, "next cache offset not found for %s @ %lu", fn, offset);
+		nextoffset = offset;
+	}
+	return nextoffset;
+}
+
+unsigned long seqcacheoffset(char *fn)
+{
+	unsigned long seqoffset = 0;
+
+	ccs->Enter();
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		if (strncmpi(fn, (*it).fn, 13) == 0)
+		{
+			// seqoffset = (*it).seqoffset + (*it).seqlen;
+		}
+	}
+	ccs->Leave();
+	return seqoffset;
+}
+
+bool in_cache(char *fn, unsigned long offset, ULONG len)
+{
+	bool incache = false;
+
+	ccs->Enter();
+
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		// deb(E_CACHEMSG, "'%s' ofs %lu fs %lu", (*it).fn, (*it).offset, (*it).fetchedsize);
+		// if (strcmpi(fn, (*it).fn) == 0)
+		// deb(E_CACHEMSG, "fn match %s", fn);
+		// else
+		// deb(E_CACHEMSG, "'%s' != '%s'", fn, (*it).fn);
+
+		if (strncmpi(fn, (*it).fn, 13) == 0 && offset >= (*it).offset && offset + len <= (*it).offset + (*it)
+			.size)
+		{
+			(*it).lastaccessed = GetTickCount();
+			// deb(E_CACHEMSG, "%s VS %s | offset %lu len %lu, otpfs %lu itfetsoiz %lu", fn, (*it).fn, offset, len, (*it).offset,
+			// (*it).fetchedsize);
+			// deb(E_CACHEMSG, "found in cache @ %p [%s] fetched: %lu, offset: %lu - %lu itofset: %lu (len %lu)",
+			// (*it).buf, fn, (*it).fetchedsize, offset, offset + len, (*it).offset, len);
+			incache = true;
+			break;
+		}
+	}
+	ccs->Leave();
+	// deb(E_CACHEMSG, "in cache '%s' %d", fn, incache);
+	// if (!incache)
+	// call_events(E_CACHEMISS, (LPVOID)fn, (LPVOID)((unsigned long)offset), (LPVOID)len,
+	// (LPVOID)GetCurrentThreadId());
+	return incache;
+}
+
+long cache_read(char *fn, unsigned long offset, LPVOID buf, ULONG len, bool paging)
+{
+
+	ccs->Enter();
+	long hits = 0;
+
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		if (strncmpi(fn, (*it).fn, 13) == 0 && offset >= (*it).offset && offset + len <= (*it).offset + (*it)
+			.size)
+		{
+
+			char *readoffset = (char*)(*it).buf;
+
+			if ((*it).offset > 0)
+				readoffset = (char*)((unsigned long)readoffset + (unsigned long)
+				((unsigned long)offset - ((unsigned long)(*it).offset)));
+			else
+				readoffset = (char*)((unsigned long)readoffset + (unsigned long)(((unsigned long)offset)));
+
+			(*it).lastaccessed = GetTickCount();
+
+			try
+			{
+				memcpy(buf, (void*)(readoffset), len);
+			}
+
+			catch(...)
+			{
+				deb("memcpy(%p, %lu, %lu) FAILED", buf, readoffset, len);
+
+				if (IsBadReadPtr((void*)(readoffset), len))
+					deb("[readoffset] memory @ %p bad read ptr for len %lu, size=%lu, ofset=%lu,itofs=%lu",
+					readoffset, len, (*it).size, (((unsigned long)(unsigned long)offset)), (*it).offset);
+
+				if (IsBadWritePtr(buf, len))
+					deb("disks [buf] @ %p is bad write ptr for %lu bytes (cache.size is %lu)", buf, len,
+					(*it).size);
+
+				exp;
+			}
+			(*it).cacheleft = (offset + len) - ((*it).offset + (*it).size);
+
+			hits = (long)(*it).hits++;
+		}
+	}
+	ccs->Leave();
+
+	return hits;
+}
+
+void cache_clear(void)
+{
+	ccs->Enter();
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		deb("cache clear %lu @ %p, left=%d", HeapSize(GetProcessHeap(), 0, (*it).buf), (*it).buf,
+			cache.size());
+		if (!HeapFree(GetProcessHeap(), 0, (*it).buf))
+			deb("heapfree: %s", fmterr());
+	}
+	cache.clear();
+	ccs->Leave();
+}
+
+int cache_seq_reads(void)
+{
+	int seqreads = 0;
+	for (vector<FATFILE>::iterator it = files.begin(); it != files.end(); it++)
+	{
+		if ((*it).sequential_reads)
+			seqreads++;
+	}
+	return seqreads;
+}
+
+int cache_save(char *ftpdir, char *fn, unsigned long offset, unsigned long size, char *buffer)
+{
+	CACHE c;
+
+	if (!size)
+		ds;
+	deb(E_DEVMSG, "save buf %p size %lu", buffer, size);
+	ccs->Enter();
+	unsigned long ofs = 0, len = 0;
+	// deb("enter");
+	memset(&c, 0, sizeof(c));
+	strncpy(c.fn, fn, sizeof(c.fn));
+	c.size = size; // HeapSize(GetProcessHeap(), 0, buffer);
+	c.fetchedsize = size;
+	c.offset = offset;
+
+	c.bufsize = size;
+	c.buf = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY | HEAP_GENERATE_EXCEPTIONS, (SIZE_T)size);
+	memcpy(c.buf, buffer, size);
+	c.bufsize = size;
+	// try
+	// {
+	// c.bufsize = (unsigned long)HeapSize(GetProcessHeap(), 0, buffer);
+	// char *bbuf = NULL;
+	// if ((SIZE_T)c.bufsize == -1)
+	// {
+	// c.bufsize = size;
+	// c.buf = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY|HEAP_GENERATE_EXCEPTIONS, size);
+	// memcpy(c.buf, buffer, size);
+	//
+	// }
+	// else
+	// {
+	// c.buf = buffer;
+	//
+	// }
+	// }
+	// catch(...)
+	// {
+	// deb("exception cache_save heapsize");
+	// ccs->Leave();
+	// return 0;
+	// }
+
+	c.len = size;
+	c.lastaccessed = GetTickCount();
+	strncpy(c.ftppath, ftpdir, sizeof(c.ftppath));
+
+	bool coagulated = false;
+
+	// if (cache.size())
+	// deb(E_FTPCONTROL, "linking %lu @ %lu", size, offset);
+	// deb(E_CACHEMSG, "ssssss", cache.size(), fn, len, ofs);
+	// if (size <= 65535)
+	// {
+	// deb("'%s' linking %lu @ %p", fn, size, c.buf);
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		if (strncmpi(fn, (*it).fn, 13) == 0 && offset == (*it).offset + (*it).size && (*it)
+			.size < precacheminbytes)
+		{
+			// if((*it).size + size >= 65535)
+			// continue;
+
+			unsigned long newsiz;
+
+			newsiz = (*it).size + size;
+			try
+			{
+				deb(E_DEVMSG, "cache match %lu @ %lu, newsiz=%lu, bufsize %lu", (*it).size, (*it).offset,
+					newsiz, (*it).bufsize);
+				if (newsiz > (*it).bufsize)
+				{
+					deb(E_DEVMSG, "rea buf %p", (*it).buf);
+					deb(E_DEVMSG, "%lu + %lu = %lu", (*it).size, size, newsiz);
+					(*it).buf = HeapReAlloc(GetProcessHeap(), 0, (*it).buf, newsiz);
+					deb(E_DEVMSG, "reallocated buf %p %u", (*it).buf,
+						HeapSize(GetProcessHeap(), 0, (*it).buf));
+					(*it).bufsize = newsiz;
+				}
+
+				char *dest;
+				dest = (char*)((unsigned long)(*it).buf + (unsigned long)(*it).size);
+
+				// deb("memcpy(%p, %p, %lu)", dest, buffer, size);
+				memcpy(dest, buffer, size);
+				// deb("done");
+			}
+			catch(...)
+			{
+				deb("except memcpy cache_save ex");
+				// ccs->Leave();
+				break;
+			}
+			(*it).size = newsiz;
+			(*it).len = newsiz;
+			ofs = (*it).offset;
+			len = newsiz;
+			(*it).bufsize = newsiz;
+			(*it).lastaccessed = GetTickCount();
+			coagulated = true;
+			// deb("blklen %lu",len);
+		}
+		else
+		{
+			// deb(E_FTPCONTROL, "offset %lu != %lu + %lu (%lu)", offset, (*it).offset, (*it).size,
+			// (*it).offset + (*it).size);
+		}
+	}
+	// deb("done link");
+	// }
+	if (!coagulated)
+	{
+		// deb("pusing cac");
+		cache.push_back(c);
+		// deb("pusing done");
+		deb(E_CACHEMSG, "new #%2d '%s' size: %5lu ofset: %7lu", cache.size(), fn, size, offset);
+		// cache_list();
+
+	}
+	else
+	{ // deb("call_events E_CACHEMSG");
+		deb(E_CACHEMSG, "add #%2d '%s' size: %lu blksize: %lu ofset: %lu", cache.size(), fn, size, len, ofs);
+		HeapFree(GetProcessHeap(), 0, c.buf);
+	}
+	ccs->Leave();
+	// deb("call_events E_PRECACHED");
+	call_events(E_PRECACHED, (LPVOID)ftpdir, (LPVOID)fn, (LPVOID)offset, (LPVOID)buffer, (LPVOID)size);
+
+	fce->SetEvent();
+	// deb("ccs->Leave();");
+	// deb(E_CACHEMSG, "aaaa", cache.size(), fn, len, ofs);
+}
+
+void cache_list(void)
+{
+	if (!ccs)
+		return;
+
+	ccs->Enter();
+	deb(E_CACHEMSG, "--- File cache: %d blocks ---", cache.size());
+	for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+	{
+		deb(E_CACHEMSG, "%13s %9lu - %9lu size=%8lu buf=%8lu accessed: %d ms", (*it).fn, (*it).offset,
+			(*it).offset + (*it).size, (*it).size, (*it).bufsize, GetTickCount() - (*it).lastaccessed);
+	}
+	ccs->Leave();
+}
+//
+// bool cache_write(long offset, LPVOID buf, ULONG len, int*hits, bool unsaved)
+// {
+// bool found = false;
+// bool notcached = true;
+// int upds = 0;
+// LARGE_INTEGER li;
+// // cev->SetEvent();
+// ccs->Enter();
+// for (vector<CACHE>::iterator it = cache.begin(); it != cache.end(); it++)
+// {
+// if ((*it).offset == offset)
+// {
+// found = true;
+// if (len > (*it).len)
+// {
+// li.QuadPart = (*it).offset;
+// // paintdisk(5, li, (*it).len, false);
+// char str[128];
+// sprintf(str, "  * КЕШ: быстрый сейв %d @ %d: \r\n    размер %5d, нужен %5d", (*it).len, (*it).offset,
+// (*it).len, len);
+// deb(str);
+// nwrite((unsigned long)(*it).buf, (*it).offset, (*it).len, 0, false, 0x00000010, str);
+// HeapFree(GetProcessHeap(), 0, (*it).buf);
+// totcachsize -= (*it).len;
+// totcachsize += len;
+// (*it).buf = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY|HEAP_GENERATE_EXCEPTIONS, len);
+// (*it).len = len;
+// // paintdisk(4, li, 1, 0);
+// // (*it).unsaved = false;
+// }
+// // deb("cache overwrite");
+// memcpy((*it).buf, buf, len);
+// //
+// (*it).changed = GetTickCount();
+// (*it).unsaved = unsaved;
+// (*it).opid = numpkt;
+// (*it).updates++;
+// if (hits)
+// * hits = (*it).hits;
+// upds = (*it).updates++;
+// break;
+// }
+// }
+// if (!found)
+// {
+// CACHE ch;
+// ch.offset = offset;
+// ch.len = len;
+// ch.buf = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY|HEAP_GENERATE_EXCEPTIONS, len);
+// memcpy(ch.buf, buf, len);
+// totcachsize += len;
+// ch.changed = GetTickCount();
+// ch.unsaved = unsaved;
+// ch.opid = numpkt;
+// ch.updates = 0;
+// ch.hits = 0;
+// upds = 0;
+// cache.push_back(ch);
+// // deb("   + закешировано %lu байт", len, offset);
+// // upds=false;
+// }
+// ccs->Leave();
+// return upds;
+// }

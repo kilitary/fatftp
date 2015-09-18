@@ -1,0 +1,59 @@
+#include "ff.h"
+#include "cache.h"
+#include <vector>
+
+#pragma hdrstop
+
+using namespace std;
+
+extern bool unmounting;
+extern TCriticalSection *ecs, *ccs;
+extern unsigned long rntrys;
+extern LONGLONG rlastoffset;
+extern unsigned long wntrys;
+extern TCriticalSection *filescs;
+extern LONGLONG wlastoffset;
+extern bool breakpasvread;
+extern bool fatreaded;
+extern unsigned int *fat;
+extern TCriticalSection *filescs;
+extern unsigned long pfat1, pfat2;
+extern int ftpstate;
+extern LONGLONG fatsize;
+extern unsigned long rootdirectory;
+extern int ftplockline;
+extern vector<FATFILE>files;
+extern bool sequential_read;
+extern long sockets_buffers;
+extern char savefile[255];    extern bool loggedin;extern int ftpstartport;extern char ip[128];
+extern bool notcheckedabor;
+extern bool aborted;
+extern unsigned long timeoutst;
+extern TCriticalSection *ftpcs;
+extern vector<CACHE>cache;
+extern SOCKET tempsock;
+extern int ftpport;
+extern DWORD pasvsockconntimeout;
+extern unsigned long lastdelay;
+extern LONGLONG clstsize;
+extern char ftphost[128];
+extern TEvent *fce;
+extern FAT32BOOT fat32boot;
+extern unsigned long lastpasvread;
+extern LONGLONG totcachsize;
+extern unsigned long precacheminbytes;
+extern DWORD ftpcontroltime, ftpdatatime;
+extern char ftpcurdir[128];
+extern bool ramdisk;
+extern double delayperc;
+extern LONGLONG curdisksize;
+extern LPVOID memory;
+extern int totreads, totwrites;
+extern double gt, bt;
+extern int numpkt;
+extern SOCKET ConnectSocket, FtpSocket;
+extern HANDLE hdisk;
+extern char drive_letter;
+extern LONGLONG disksize;
+extern double ibytesin, ibytes_sttime, ibytes_st, ibps, ilastlen;
+extern double obytesin, obytes_sttime, obytes_st, obps, olastlen;

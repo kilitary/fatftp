@@ -1,0 +1,1033 @@
+#include "ff.h"
+
+#include "vdskapi.h"
+#include "disk.h"
+#include "functions.h"
+#include "extern.h"
+#include <vector>
+#include "ftp.h"
+#include "cache.h"
+
+using namespace std;
+bool precachedthisfn = false;
+bool sequential_read = false;
+unsigned long lastoffset = 0;
+unsigned long lastlen = 0;
+char lastfn[255];
+int seqhits = 0;
+unsigned long lastfsize = 0;
+char lastwrittenfn[255] = "";
+
+extern char nowcachingdosfn[255];
+bool processing_disk_event = false;
+bool fatreaded = false;
+unsigned long writtenlen = 0;
+DWORD lastdisktime;
+
+unsigned long savedata(char *ftpdir, char *fn, unsigned long len)
+{
+	char tb[5120];
+	int rr = 0;
+	unsigned long offset = 0;
+	ftpcontroltime = 0;
+	ftpdatatime = 0;
+	char buf[1024];
+
+	char *nbuf = 0;
+
+	unsigned long rrr = ftpsavefile(ftpdir, fn, 0, len, 0);
+	if (rrr)
+		DeleteFile(savefile);
+	// HeapFree(GetProcessHeap(), 0, nbuf);
+	writtenlen = 0;
+	// filescs->Leave();
+	return rrr;
+}
+
+int adddata(char *fname, void* buf, unsigned long len)
+{
+	HANDLE h = INVALID_HANDLE_VALUE;
+	filescs->Enter();
+
+	char ff[255];
+	if (fname)
+	{
+		if (!FileExists(L"storage"))
+			CreateDirectory("storage", 0);
+		// if (!CreateDirectory("unsaved", 0))
+		// deb("createdir unsaved: %s", fmterr());
+
+		sprintf(ff, "storage\\%s", fname);
+	}
+	else
+	{
+		sprintf(ff, "storage\\%s", savefile);
+		writtenlen += len;
+	}
+
+	deb(E_DEVMSG, "   %11s %8lu + %6lu ", fname ? ff : lastwrittenfn,
+		fname ? savefilesize(fname) : writtenlen, len);
+
+	while ((h = CreateFile(ff, GENERIC_WRITE, 0, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0))
+		== INVALID_HANDLE_VALUE)
+	{
+		deb(E_FTPCONTROL, "adddata createfile(%s) %s", ff, fmterr());
+		// filescs->Leave();
+		Sleep(100);
+		continue;
+	}
+	DWORD dwWritten = 0;
+
+	SetFilePointer(h, 0, 0, FILE_END);
+	WriteFile(h, buf, len, &dwWritten, 0);
+	FlushFileBuffers(h);
+	// deb("write %lu bytes", dwWritten);
+
+	CloseHandle(h);
+	filescs->Leave();
+}
+
+unsigned long savefilesize(char *fn)
+{
+	HANDLE h;
+	filescs->Enter();
+
+	char ff[255];
+	if (fn)
+	{
+
+		sprintf(ff, "storage\\%s", fn);
+	}
+	else
+	{
+		sprintf(ff, "storage\\%s", savefile);
+
+	}
+
+	h = CreateFile(ff, GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+	if (h == INVALID_HANDLE_VALUE)
+	{
+		// deb(E_FTPCONTROL, "savefilesize createfile(%s) %s", ff, fmterr());
+		// CloseHandle(h);
+		filescs->Leave();
+		return 0;
+	}
+	DWORD dwWritten = 0;
+
+	///SetFilePointer(h, 0, 0, FILE_END);
+	DWORD s;
+	s = GetFileSize(h, 0);
+
+	// deb("write %lu bytes", dwWritten);
+
+	CloseHandle(h);
+	filescs->Leave();
+	return(unsigned long)s;
+}
+
+void namedata(char *fn, unsigned long size)
+{
+	HANDLE h;
+	HANDLE h2;
+	filescs->Enter();
+
+	deb(E_DEVMSG, "naming %lu bytes %s", savefilesize(0), fn);
+
+	char ff[255];
+
+	sprintf(ff, "storage\\%s", savefile);
+
+	h = CreateFile(ff, GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+		0);
+	if (h == INVALID_HANDLE_VALUE)
+	{
+
+		filescs->Leave();
+		return;
+	}
+	sprintf(ff, "storage\\%s", fn);
+	h2 = CreateFile(ff, GENERIC_WRITE, 0, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+	if (h2 == INVALID_HANDLE_VALUE)
+	{
+
+		filescs->Leave();
+		return;
+	}
+	DWORD dwWritten = 0;
+
+	DWORD s;
+	s = GetFileSize(h, 0);
+
+	while (size > 0)
+	{
+		char buf[1024];
+		ReadFile(h, buf, 1024, &dwWritten, 0);
+		WriteFile(h2, buf, 1024, &dwWritten, 0);
+		if (dwWritten < size)
+			size -= dwWritten;
+		else
+			size = 0;
+
+		// deb("size %lu", size);
+	}
+
+	CloseHandle(h);
+	CloseHandle(h2);
+	sprintf(ff, "storage\\%s", savefile);
+	DeleteFile(ff);
+	writtenlen = 0;
+	filescs->Leave();
+}
+
+void checknewfiles(char *memptr)
+{
+	filescs->Enter();
+	// deb("checking %p (%x)", memptr, *memptr);
+	while (*memptr)
+	{
+		DIR dir;
+		memcpy(&dir, memptr, sizeof(DIR));
+
+		if (dir.attr != 0x20 || dir.fname[0] == 'е')
+		{
+			memptr += sizeof(DIR);
+			continue;
+		}
+
+		bool found;
+		found = false;
+		// vector<FATFILE>::iterator it;
+		FATFILE file;
+		filescs->Enter();
+		for (vector<FATFILE>::iterator it2 = files.begin(); it2 != files.end(); it2++)
+		{
+			// deb("memcmp(' % s ',' % s ')", dosfn, (*it).dosfn);
+			if (memcmp(dir.fname, (*it2).dosfn, 11) == 0)
+			{
+				memcpy((void*) & file, (void*) & (*it2), sizeof(file));
+				found = true;
+				// it = it2;
+				char fn[255];
+				memset(fn, 0, sizeof(fn));
+				(*it2).dosfn[11] = 0;
+				memcpy(fn, (*it2).dosfn, 8);
+				for (int i = 0; i < 255; i++)
+					if (fn[i] == 0x20)
+						fn[i] = 0x0;
+				if (strlen((*it2).dosfn + 8))
+				{
+					strcat(fn, ".");
+					strcat(fn, (*it2).dosfn + 8);
+				}
+				fn[12] = 0;
+
+				unsigned long fclst;
+				fclst = (unsigned long)make_dword(dir.st_clust_l, dir.st_clust_h);
+				unsigned short lmodtime;
+				unsigned short crtime;
+				unsigned short laccessdate;
+				unsigned char attr;
+				unsigned long nclusters;
+
+				attr = dir.attr;
+
+				laccessdate = dir.laccessdate;
+				crtime = dir.crtime;
+				lmodtime = dir.lmodtime;
+
+				if (dir.size)
+					nclusters = (unsigned long)(dir.size / clstsize) + 1;
+
+				if (dir.size != file.size)
+				{
+					deb(E_DEVMSG, "size change %s %lu => %lu", (*it2).dosfn, file.size, dir.size);
+
+					(*it2).size = dir.size;
+
+					(*it2).start_offset = getclusterbyte(fclst);
+					(*it2).end_offset = getclusterbyte(fclst) + (nclusters * clstsize); // dir.size;
+					// deb(E_DEVMSG, "end_offset %lu", (*it2).end_offset);
+					char sf[255] = "storage\\data.unk";
+					(*it2).unsaved = true;
+					sprintf(sf, "storage\\%s", (*it2).fn);
+					// if (FileExists(sf) && savefilesize((*it2).fn) <= (unsigned long)dir.size)
+					// deb(E_FTPCONTROL, "savefile only %lu, need %lu", savefilesize((*it2).fn),
+					// (unsigned long)dir.size);
+					if (!FileExists(sf))
+					{
+						// deb(E_FTPCONTROL, "no savefile %s exits", sf);
+						sprintf(sf, "storage\\data.unk", (*it2).fn);
+
+						// (*it2).unsavedlen = dir.size;
+					}
+					else
+					{
+
+					}
+					if (savefilesize(0))
+					{
+						namedata((*it2).fn, (unsigned long)dir.size);
+						(*it2).unsavedlen = dir.size;
+					}
+					else
+					{
+						// deb("no data for %s", (*it2).fn);
+						// ds;
+					}
+					// savedata((*it2).ftppath, fn, dir.size);
+				}
+
+				if (fclst != file.firstcluster)
+				{
+					// deb(E_FTPCONTROL, "first cluster change %s %lu => %lu", (*it2).dosfn, file.firstcluster,
+					// fclst);
+					(*it2).firstcluster = fclst;
+
+					if (fclst)
+					{
+						(*it2).start_offset = getclusterbyte(fclst);
+						// (*it2).end_offset = getclusterbyte(fclst) + dir.size; // getclusterbyte(nclusters);
+					}
+				}
+
+				if (lmodtime != file.lmodtime)
+				{
+					// deb(E_FTPCONTROL, "modify time %s %u => %u", (*it2).dosfn, file.lmodtime, lmodtime);
+					(*it2).lmodtime = dir.lmodtime;
+				}
+				if (crtime != file.crtime)
+				{
+					// deb(E_FTPCONTROL, "crtime time %s %u => %u", (*it2).dosfn, file.crtime, crtime);
+					(*it2).crtime = dir.crtime;
+				}
+				if (laccessdate != file.laccessdate)
+				{
+					// deb(E_FTPCONTROL, "laccessdate time %s %u => %u", (*it2).dosfn, file.laccessdate,
+					// laccessdate);
+					(*it2).laccessdate = dir.laccessdate;
+				}
+
+				if (attr != file.attr)
+				{
+					// deb(E_FTPCONTROL, "attr %s %u => %u", (*it2).dosfn, file.attr, attr);
+					(*it2).attr = dir.attr;
+				}
+
+				unsigned short st_clust_l, st_clust_h;
+				st_clust_l = dir.st_clust_l;
+				st_clust_h = dir.st_clust_h;
+				if (st_clust_l != file.st_clust_l)
+				{
+					// deb(E_FTPCONTROL, "st_clust_l %s %u => %u", (*it2).dosfn, file.st_clust_l, st_clust_l);
+					// (*it2).st_clust_l = dir.st_clust_l;
+				}
+				if (st_clust_h != file.st_clust_h)
+				{
+					// deb(E_FTPCONTROL, "st_clust_h %s %u => %u", (*it2).dosfn, file.st_clust_h, st_clust_h);
+					// (*it2).st_clust_h = dir.st_clust_h;
+				}
+				break;
+			}
+		}
+		filescs->Leave();
+
+		if (!found && dir.fname[0] != 'е' && dir.fname[0] != 'е')
+		{
+			FATFILE f;
+			memset((void*) & f, 0, sizeof(f));
+
+			if (writtenlen)
+			{
+				deb(E_FTPCONTROL, "saving previous data for %s (%lu bytes)", lastwrittenfn, writtenlen);
+				// savedata("", lastwrittenfn, writtenlen);
+			}
+
+			DWORD stcl;
+			stcl = make_dword(dir.st_clust_l, dir.st_clust_h);
+			char fname[255];
+			memset(fname, 0, sizeof(fname));
+			memcpy(fname, dir.fname, 11);
+			// deb("new file ' % s ' size %u,stcll %lu", fname, dir.size, stcl);
+
+			f.memory = 0; // HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 32768);
+			f.memsize = 0; // 32768;
+
+			f.lmodtime = dir.lmodtime;
+			f.crtime = dir.crtime;
+			f.laccessdate = dir.laccessdate;
+			f.attr = dir.attr;
+			f.st_clust_l = dir.st_clust_l;
+			f.st_clust_h = dir.st_clust_h;
+
+			char fn[255];
+			memset(fn, 0, sizeof(fn));
+			dir.fname[11] = 0;
+			memcpy(fn, dir.fname, 8);
+			for (int i = 0; i < 255; i++)
+				if (fn[i] == 0x20)
+					fn[i] = 0x0;
+			strcat(fn, ".");
+			strcat(fn, dir.fname + 8);
+			fn[12] = 0;
+
+			strcpy(f.fn, fn);
+			strcpy(f.dosfn, dir.fname);
+			strcpy(lastwrittenfn, fn);
+			unsigned long stc;
+			unsigned long nclusters;
+
+			if (dir.size)
+				nclusters = (unsigned long)(dir.size / clstsize);
+			stc = stcl;
+			if (stc)
+			{
+				f.start_offset = getclusterbyte(stc);
+				f.end_offset = getclusterbyte(stc) + ((unsigned long)dir.size > clstsize ? (unsigned long)
+					dir.size : clstsize);
+				// + getclusterbyte(nclusters);
+			}
+			// deb("set offsets %lu - %lu", f.start_offset, f.end_offset);
+			f.firstcluster = stc;
+			f.clusters = 1;
+			f.accesses = 0;
+			f.dir = false;
+			// deb("ftppath @ %p", file.ftppath);
+			// deb("ftppath %s", file.ftppath);
+
+			strcpy(f.ftppath, file.ftppath);
+			f.size = dir.size;
+			f.fetched = true;
+			files.push_back(f);
+			deb(E_DEVMSG, "%s added size %lu, cluster %lu, lmodtime %u, crtime %u, attr %d", fname, f.size,
+				stcl, f.lmodtime, f.crtime, f.attr);
+
+			// call_events(E_FATADD, (LPVOID)(*it).ftppath, (LPVOID)dir.fname, (LPVOID)f.size);
+			// break;
+		}
+		// else
+		// deb("checked %s", dir.fname);
+		memptr += sizeof(DIR);
+	}
+	filescs->Leave();
+	// deb("checked %p (%x)", memptr, *memptr);
+}
+
+DWORD __stdcall OnRead(IN HANDLE hDisk, IN PVOID Context, IN PVOID Buffer, IN ULONG Length,
+	IN LARGE_INTEGER ByteOffset, IN BOOL PagingIo, OUT PULONG BytesRead)
+{
+	// ecs->Enter();
+
+	bool cached = false;
+	unsigned long ptr;
+	unsigned long flen = 0;
+	unsigned long stofs, enofs;
+	unsigned long clst;
+	char fs[12930];
+	static char curdir[1024] = "";
+	char fp[222];
+	int code = 250;
+	bool recognized_read = false;
+	unsigned long nrd;
+	char *buf;
+
+	if (fce)
+		fce->ResetEvent();
+	lastdisktime = GetTickCount();
+	// processing_disk_event = true;
+	// deb("seqhits %d, precachedthisfn %d", seqhits, precachedthisfn);
+	if (fatreaded)
+		call_events(E_DISKREAD, (LPVOID)Buffer, (LPVOID)Length, (LPVOID)ByteOffset.QuadPart,
+		(LPVOID)PagingIo);
+
+	if (unmounting)
+	{
+		// processing_disk_event = false;
+		// ecs->Leave();
+		return IO_OP_STATUS_UNSUCCESSFUL;
+	}
+
+	// ecs->Enter();
+
+	DWORD tms = GetTickCount();
+	LARGE_INTEGER bka;
+	bka = ByteOffset;
+
+	if ((ByteOffset.QuadPart >= pfat1 && (unsigned long)ByteOffset.QuadPart + (unsigned long)Length <=
+			(unsigned long)pfat2 + (unsigned long)fatsize))
+	{
+
+		// deb("   read of FAT len %d ofs %d crc %x", (int)Length,
+		// (int)ByteOffset.QuadPart,
+		// checksum((unsigned short*)((long)memory + ByteOffset.QuadPart),
+		// Length));
+		if (fatreaded)
+			call_events(E_FATREAD, (LPVOID)ByteOffset.QuadPart, (LPVOID)Length);
+		recognized_read = true;
+
+	}
+	else
+	{
+		deb("OnRead(%8p, %5lu, @ %I64d, PagingIo: %d)", Buffer, Length, ByteOffset.QuadPart, PagingIo);
+	}
+
+	if (ByteOffset.QuadPart >= 1024 && ByteOffset.QuadPart < pfat1)
+	{
+		recognized_read = true;
+		deb("read of reserved sector len %d ofs %d", (int)Length, (int)ByteOffset.QuadPart);
+		if (fatreaded)
+			call_events(E_FATRESERVEDREAD, (LPVOID)ByteOffset.QuadPart, (LPVOID)Length);
+	}
+
+	if (ByteOffset.QuadPart >= rootdirectory && ByteOffset.QuadPart <= rootdirectory + files.size()
+		* 2 * sizeof(DIR))
+	{
+		recognized_read = true;
+		deb("read of root directory len %d ofs %d", (int)Length, (int)ByteOffset.QuadPart);
+		if (fatreaded)
+			call_events(E_FATROOTREAD, (LPVOID)ByteOffset.QuadPart, (LPVOID)Length);
+	}
+	// deb("entering files");
+	filescs->Enter();
+	// deb("entered");
+	for (vector<FATFILE>::iterator it = files.begin(); it != files.end(); it++)
+	{
+		// deb("%s", (*it).fn);
+		if (!(*it).start_offset)
+			continue;
+
+		stofs = (unsigned long)(*it).start_offset;
+		enofs = (unsigned long)(*it).end_offset;
+
+		if ((unsigned long)ByteOffset.QuadPart >= (unsigned long)stofs && (unsigned long)
+			ByteOffset.QuadPart + (unsigned long)Length <= enofs)
+		{
+			// deb("read file %s", (*it).fn);
+			fatreaded = true;
+			(*it).lastdisktime = GetTickCount();
+			(*it).lastaccessed = GetTickCount();
+			(*it).accesses++;
+			unsigned long offset = (unsigned long)ByteOffset.QuadPart - (unsigned long)(*it).start_offset;
+			unsigned long len = (unsigned long)Length;
+			recognized_read = true;
+
+			clst = getbytecluster((unsigned long)ByteOffset.QuadPart);
+
+			ptr = (*it).size - ((*it).end_offset - ByteOffset.QuadPart);
+			ptr /= clstsize;
+
+			stofs = (unsigned long)((unsigned long)ByteOffset.QuadPart - (*it).start_offset);
+			enofs = (unsigned long)((unsigned long)ByteOffset.QuadPart - (*it).start_offset + Length);
+
+			if (fatreaded)
+				call_events((*it).dir ? E_DIRREAD : E_FILEREAD, (LPVOID)(*it).fn, (LPVOID)(*it).memory,
+				(LPVOID)((unsigned long)(unsigned long)offset), (LPVOID)Length, (LPVOID)(*it).start_offset,
+				(LPVOID)(*it).end_offset, (LPVOID)stofs);
+
+			// check for cache
+			if (!(*it).dir)
+			{
+
+				int seqreads = cache_seq_reads();
+				if (offset && offset == (*it).lastoffset + (*it).lastlen)
+				{
+					if (!(*it).sequential_reads)
+						deb(E_CACHEMSG, "seq detected %s @ %lu", (*it).fn, offset);
+					(*it).sequential_reads++;
+					(*it).seqoffset = offset;
+					(*it).seqlen = len;
+					(*it).lastoffset = offset;
+					(*it).lastlen = len;
+
+					(*it).lastcacheoffset = (*it).nextcacheoffset;
+					(*it).lastcachelen = (*it).nextcachelen;
+
+					(*it).nextcachelen = (unsigned long)
+						((unsigned long)precacheminbytes / ((unsigned long)seqreads ? (unsigned long)
+							seqreads : (unsigned long)1));
+
+					if ((*it).nextcachelen < 512000)
+						(*it).nextcachelen = 512000;
+
+					if ((*it).nextcacheoffset >= (unsigned long)(*it).size)
+					{
+						(*it).nextcacheoffset = 0;
+					}
+
+				}
+				else
+				{
+
+					(*it).seqlen = len;
+					(*it).lastoffset = offset;
+					(*it).lastlen = len;
+					(*it).seqoffset = offset;
+					(*it).sequential_reads = 0;
+
+				}
+				// (*it).nextcacheoffset = offset + len;
+				bool done;
+				done = false;
+
+				DWORD wtm;
+				wtm = GetTickCount();
+				DWORD wwtm;
+				while (!done)
+				{
+					if (unmounting)
+					{
+						filescs->Leave();
+						ecs->Leave();
+						return IO_OP_STATUS_SUCCESS;
+					}
+
+					if (in_cache((*it).fn, ((unsigned long)offset), Length))
+					{
+						// deb("cache hit");
+						// deb(E_CACHEMSG, "found %s", (*it).dosfn);
+						call_events(E_CACHEHIT, (LPVOID)(*it).fn,
+							(LPVOID)((unsigned long)ByteOffset.QuadPart - (unsigned long)(*it)
+								.start_offset), (LPVOID)Length, (LPVOID)GetCurrentThreadId());
+
+						if (GetTickCount() - wtm >= 500)
+							deb(E_CACHEMSG, "'%s' block %6lu @ %8lu [ in %5d ms ] seqrds %d", (*it).fn,
+							Length, (unsigned long)ByteOffset.QuadPart - (unsigned long)(*it)
+							.start_offset, GetTickCount() - wtm, seqreads);
+
+						cache_read((*it).fn, offset, Buffer, Length, PagingIo);
+
+						(*it).lastoffset = offset;
+						(*it).lastlen = Length;
+						(*it).seqlen = Length;
+						(*it).seqoffset = offset;
+
+						*BytesRead = (unsigned long)Length;
+						filescs->Leave();
+						// ecs->Leave();
+						// deb("leaved files");
+						return IO_OP_STATUS_SUCCESS;
+					}
+					else if ((*it).nowcaching && offset >= (*it).nowcachingoffset && offset + Length <= (*it)
+						.nowcachingoffset + (*it).nowcachinglen) // && GetTickCount() - wtm <= 1000
+					{
+
+						wwtm = GetTickCount() - wtm;
+						if (GetTickCount() - wtm >= 1000)
+							deb(E_CACHEMSG, "waiting block @ %lu %5d ms [nowcaching %lu @ %lu]", offset,
+							GetTickCount() - wtm, (*it).nowcachinglen, (*it).nowcachingoffset);
+						Sleep(70);
+						continue;
+					}
+					else
+					{
+						if ((*it).nowcaching)
+							deb(E_CACHEMSG, "break cache read %lu @ %lu", (*it).nowcachinglen,
+							(*it).nowcachingoffset);
+						breakpasvread = true;
+						break;
+					}
+
+				}
+				// if (wwtm >= 500)
+				deb(E_CACHEMSG, "self-cache: '%s' block %6lu @ %8lu [ %5d ms ] seqrds %d", (*it).fn, Length,
+					(unsigned long)offset, wwtm, seqreads);
+
+				if ((*it).nowcaching)
+					deb(E_CACHEMSG, "nowcaching %lu @ %lu, seq %lu", (*it).nowcachinglen,
+					(*it).nowcachingoffset, (*it).sequential_reads);
+
+				strncpy(curdir, ftpcurdir, sizeof(curdir));
+
+				// ftpcs->Enter();
+				ftplock();
+				if (strcmpi((*it).ftppath, ftpcurdir) != 0)
+				{
+
+					ftpcd("/");
+					code = 250;
+
+					if (strlen((*it).ftppath))
+						code = ftpcd((*it).ftppath);
+
+					if (code != 250)
+					{
+						ftpcd("/");
+						// ecs->Leave();
+						processing_disk_event = false;
+						// ftpcs->Leave();
+						ftpunlock();
+						filescs->Leave();
+						ecs->Leave();
+						// deb("leaved files");
+						return IO_OP_STATUS_UNSUCCESSFUL;
+					}
+
+					strcpy(ftpcurdir, (*it).ftppath);
+
+				}
+
+				// if (Length < 65535 && stofs == 0)
+				// flen = 65535;
+				// else
+				flen = Length;
+				deb("ftpgetfile(%-15s, %8lu, %8p, %8lu)", (*it).fn, (unsigned long)stofs, Buffer,
+					(unsigned long)flen);
+
+				call_events(E_FTPPREGETFILE, (LPVOID)(*it).ftppath, (LPVOID)(*it).fn, (LPVOID)stofs,
+					(LPVOID)Buffer, (LPVOID)flen);
+
+				DWORD ftpgettm = GetTickCount();
+
+				// ftpcs->Enter();
+				// deb("exec %p %lu", buf, flen);
+
+				nrd = ftpgetfile((*it).fn, (unsigned long)stofs, (char*)Buffer, Length, (*it).dosfn);
+				// ftpcs->Leave();
+				ftpunlock();
+				// deb(E_CACHEMSG, "precacheclstrs [%lu]", (*it).precacheclstrs);
+				deb("ftpgetfile(%-15s, %8lu, %8p, %8lu) = %lu", (*it).fn, (unsigned long)stofs, Buffer,
+					(unsigned long)flen, nrd);
+
+				call_events(E_FTPGETFILE, (LPVOID)(*it).fn, (LPVOID)stofs, (LPVOID)Buffer, (LPVOID)flen,
+					(LPVOID)ftpcontroltime, (LPVOID)ftpdatatime, (LPVOID)nrd);
+
+				lastoffset = (unsigned long)offset;
+				*BytesRead = (unsigned long)Length;
+
+				lastlen = Length;
+				lastfsize = (*it).size;
+
+				(*it).lastoffset = offset;
+				(*it).lastlen = Length;
+
+				if ((*it).nextcacheoffset)
+					(*it).nextcacheoffset = offset + nrd;
+				// deb(E_CACHEMSG, "set next %lu", (*it).nextcacheoffset);
+				// ecs->Leave();
+				// fce->SetEvent();
+				processing_disk_event = false;
+
+				fatreaded = true;
+				filescs->Leave();
+				// ecs->Leave();
+				// deb("leaved files");
+				return IO_OP_STATUS_SUCCESS;
+
+			}
+			else
+			{
+				deb("mem dir copy %p", (*it).memory);
+				// deb("memcpy (%p,%p,%lu)", Buffer, (*it).memory, (unsigned long)Length);
+				if ((*it).memory)
+					memcpy(Buffer, (*it).memory, Length);
+				else
+				{
+
+					deb("no memory for %s !", (*it).fn);
+				}
+				filescs->Leave();
+				*BytesRead = (unsigned long)Length;
+				// deb("leaved files");
+				processing_disk_event = false;
+				// ecs->Leave();
+				return IO_OP_STATUS_SUCCESS;
+			}
+
+		}
+
+	}
+	filescs->Leave();
+
+	if (!recognized_read)
+		deb("unk read! %5lu @ %I64d", Length, ByteOffset.QuadPart);
+
+	if (((unsigned long)ByteOffset.QuadPart + Length) < (unsigned long)HeapSize(GetProcessHeap(), 0, memory))
+	// HeapSize(GetProcessHeap(), 0, memory))
+		memcpy(Buffer, (LPVOID)((unsigned long)memory + (unsigned long)ByteOffset.QuadPart), Length);
+	else
+		deb("skipped memcpy %lu @ %lu [curdisksize=%lu]", Length, (unsigned long)ByteOffset.QuadPart,
+		(unsigned long)curdisksize);
+
+	*BytesRead = (unsigned long)Length;
+
+	// ecs->Leave();
+	// fce->SetEvent();
+	return IO_OP_STATUS_SUCCESS;
+
+}
+
+DWORD __stdcall OnWrite(IN HANDLE hDisk, IN PVOID Context, IN PVOID Buffer, IN ULONG Length,
+	IN LARGE_INTEGER ByteOffset, IN BOOL PagingIo, OUT PULONG BytesWritten)
+{
+	ecs->Enter();
+
+	processing_disk_event = true;
+	call_events(E_DISKWRITE, (LPVOID)Buffer, (LPVOID)Length, (LPVOID)ByteOffset.QuadPart, (LPVOID)PagingIo);
+	// return IO_OP_STATUS_UNSUCCESSFUL;
+	DWORD tms = GetTickCount();
+	char str[128];
+	char qqq[222];
+	bool recognized_write = false;
+	if (unmounting)
+	{
+		processing_disk_event = false;
+		ecs->Leave();
+		// fce->SetEvent();
+		return IO_OP_STATUS_UNSUCCESSFUL;
+	}
+	lastdisktime = GetTickCount();
+	// ecs->Enter();
+	sprintf(str, "WRITE %-5u @ %-8I64d", Length, ByteOffset.QuadPart);
+	// if (Form1->debcheck->Checked)
+	OutputDebugString(str);
+	char trys[111];
+	if (ByteOffset.QuadPart != wlastoffset)
+		wntrys = 0;
+	else
+		wntrys++;
+	wlastoffset = ByteOffset.QuadPart;
+	str[0] = qqq[0];
+	str[1] = 0;
+	if (ByteOffset.QuadPart <= pfat1)
+	{
+		// if (Form1->debcheck->Checked)
+		// deb("WRITE of reserved sector len %d ofs %d", (int)Length, (int)ByteOffset.QuadPart);
+		// printf(qqq, "w#RESERVED sector %lu", (unsigned long)ByteOffset.QuadPart / fat32boot.bytes_per_sector);
+		recognized_write = true;
+		// Form1->imgptr->Caption = qqq;
+	}
+	if ((ByteOffset.QuadPart >= pfat1 && ByteOffset.QuadPart < rootdirectory))
+	{
+
+		// if ((ByteOffset.QuadPart >= pfat2 && ByteOffset.QuadPart < rootdirectory))
+		// deb("WRITE FAT crc %x", checksum((unsigned short*)((long)Buffer), Length));
+		if (fatreaded)
+			call_events(E_FATWRITE, (LPVOID)ByteOffset.QuadPart, (LPVOID)Length);
+		// deb(E_FTPCONTROL, "WRITE of FAT len %d ofs %d crc %x", (int)Length, (int)ByteOffset.QuadPart,
+		// checksum((unsigned short*)((long)Buffer), Length));
+		recognized_write = true;
+	}
+	filescs->Enter();
+	for (vector<FATFILE>::iterator it = files.begin(); it != files.end(); it++)
+	{
+		unsigned long stofs = (unsigned long)(*it).start_offset;
+		unsigned long enofs = (unsigned long)(*it).end_offset;
+
+		if ((unsigned long)ByteOffset.QuadPart >= (unsigned long)stofs && (unsigned long)
+			ByteOffset.QuadPart + (unsigned long)Length <= enofs)
+		{
+
+			unsigned long ptr;
+
+			stofs = (unsigned long)ByteOffset.QuadPart - (*it).start_offset;
+			enofs = (unsigned long)ByteOffset.QuadPart - (*it).start_offset + Length;
+
+			ptr = ((unsigned long)ByteOffset.QuadPart - (unsigned long)rootdirectory);
+			ptr /= (unsigned long)clstsize;
+			// if (Form1->netdebug->Checked)                            '
+			if (fatreaded)
+				call_events((*it).dir ? E_DIRWRITE : E_FILEWRITE, (LPVOID)(*it).fn, (LPVOID)(*it).memory,
+				(LPVOID)((unsigned long)(unsigned long)stofs), (LPVOID)Length, (LPVOID)(*it).start_offset,
+				(LPVOID)(*it).end_offset, (LPVOID)stofs);
+
+			// deb("WRITE %5d cluster %4lu of file %-15s : %8d - %-8d", (int)Length, ptr, (*it).fn, stofs,
+			// enofs);
+			// else
+			// if ((*it).dir)
+			// deb("WRITE '%s' #%5lu", (*it).fn, (*it).numwrites);
+
+			char fs[129];
+			sprintf(fs, "w#%s:%3d", (*it).fn, (ByteOffset.QuadPart / fat32boot.bytes_per_sector) / clstsize);
+			// Form1->imgptr->Caption = fs;
+			// memset((LPVOID)((unsigned long)memory + ByteOffset.QuadPart), 0, Length);
+
+			(*it).lastdisktime = GetTickCount();
+			(*it).lastaccessed = GetTickCount();
+			(*it).accesses++;
+
+			if (!(*it).dir)
+			{
+				(*it).nowwriting = true;
+				(*it).unsaved = true;
+
+			}
+			else
+			{
+				char dirb[1024];
+
+				// sprintf(dirb, "%s_%lu", (*it).fn, (*it).numwrites);
+				// dump((char*)Buffer, (int)Length, dirb);
+			}
+			(*it).numwrites++;
+			*BytesWritten = Length;
+			if ((*it).dir)
+			{
+				if ((*it).memory)
+					memcpy((LPVOID)((unsigned long)(*it).memory), Buffer, Length);
+				// int recs = count_recs((*it).memory);
+				// if ((*it).numrecs != recs)
+				// {
+				// deb("recs %d (old %d)", recs, (*it).numrecs);
+				checknewfiles((char*)(*it).memory);
+				// }
+				// (*it).numrecs = recs;
+			}
+			else
+			{
+				adddata((*it).fn, Buffer, Length);
+				// deb("immediate save");
+				// ftpsavefile((*it).ftppath, (*it).fn, (char*)Buffer, Length, stofs);
+				// adddata(Buffer, Length);
+			}
+			if (!(*it).dir)
+			{
+				(*it).unsavedlen += Length;
+				(*it).unsaved = true;
+			}
+			// ecs->Leave();
+			// processing_disk_event = false;
+			// fce->SetEvent();
+			filescs->Leave();
+			ecs->Leave();
+			return IO_OP_STATUS_SUCCESS;
+		}
+	}
+
+	if (!recognized_write && fatreaded)
+	{
+
+		unsigned long fc;
+
+		deb(E_DEVMSG, "unrecognized write %lu @ %lu (bt %lu-%lu)", Length,
+			(unsigned long)ByteOffset.QuadPart,
+			(unsigned long)(ByteOffset.QuadPart - (unsigned long)(getclusterbyte(9))),
+			(unsigned long)(ByteOffset.QuadPart - (unsigned long)getclusterbyte(9)) + Length,
+			lastwrittenfn[0] ? lastwrittenfn : "<unk>");
+
+		adddata(savefile, Buffer, Length);
+
+	}
+	filescs->Leave();
+	*BytesWritten = (unsigned long)Length;
+	ecs->Leave();
+	return IO_OP_STATUS_SUCCESS;
+	// totwrites++;
+	// if (ramdisk)
+	// {
+	// //
+	// // Application->ProcessMessages();
+	// memcpy((char*)memory + ByteOffset.QuadPart, Buffer, Length);
+	// // OutputDebugString("done memcpy");
+	// tms = GetTickCount() - tms;
+	// delayperc += tms;
+	// if (tms < 50)
+	// gt++;
+	// if (tms >= 50)
+	// bt++;
+	// // dp = (gt>bt?bt/gt:gt/bt)*100.0;
+	// // // if (dp >= 15.0)
+	// //
+	// // if (dp>50.0)
+	// // Form1->delays->Color = clWhite;
+	// //
+	// // else
+	// // Form1->delays->Color = clLtGray;
+	// // tmsleft=15;
+	// char str[234];
+	// // sprintf(str, "задержка %.2f %% (gt %.2f bt %.2f)", dp, gt, bt);
+	// // Form1->delays->Caption = str;
+	// // Form1->debcheck->Checked = false;
+	// // Form1->debcheck->Checked = false;
+	// // else
+	// // if (!tms)
+	// // Form1->debcheck->Checked = true;
+	// sprintf(str, "#%3d WRITE %5u @ %-8I64d CRC=0x%04X [%4d мс]", numpkt++, Length, ByteOffset.QuadPart,
+	// checksum((unsigned short*)Buffer, Length), tms);
+	// OutputDebugString(str);
+	// // if (Form1->debcheck->Checked)
+	// deb(str);
+	// // paintdisk(4, ByteOffset, 1, 0);
+	// *BytesWritten = Length;
+	// return IO_OP_STATUS_SUCCESS;
+	// }
+	// else
+	// {
+	// deb("non ramdisk!");
+	// }
+	// // Form1->current->Text = str;
+	// // deb(str);
+	// // Application->ProcessMessages();
+	// // if (Form1->Button1->Enabled)
+	// {
+	// deb("write unsuccess");
+	// return IO_OP_STATUS_UNSUCCESSFUL;
+	// }
+	// //
+	// // cev->SetEvent();
+	// deb("#%3d WRITE %5u @ %-8I64d CRC=0x%04X", numpkt++, Length, ByteOffset.QuadPart,
+	// checksum((unsigned short*)Buffer, Length));
+	// Length = cache_write(ByteOffset.QuadPart, Buffer, Length, NULL, true);
+	// *BytesWritten = Length;
+	// // paintdisk(4, ByteOffset, 1, 0);
+	// return IO_OP_STATUS_SUCCESS;
+
+}
+
+VOID __stdcall OnEvent(IN HANDLE hDisk, IN LONG DiskEvent, IN PVOID Context)
+{
+	call_events(E_DISKERROR, (LPVOID)hDisk, (LPVOID)DiskEvent);
+	shutdown(ConnectSocket, SD_BOTH);
+	closesocket(ConnectSocket);
+	ConnectSocket = 0;
+	VdskUnmountDisk(hdisk, drive_letter);
+	VdskDeleteDisk(hdisk);
+	// MessageBox(Application->MainFormHandle,
+	// "Критическая ошибка диска. Перезапуск.", "ошибка", MB_OK);
+	// VdskUnmountDisk(hdisk,' y ');
+	// VdskMountDisk(hdisk,' y ',true);
+	deb(" !!!!!!!!!!!!! Критическая ошибка диска: %d, перезапуск ...", DiskEvent);
+	// Application->ProcessMessages();
+	LARGE_INTEGER size;
+	size.QuadPart = disksize;
+	hdisk = VdskCreateVirtualDisk((LARGE_INTEGER)size, 2, 32, 16384,
+		VDSK_DISK_REMOVABLE | VDSK_DISK_MEDIA_IN_DEVICE, 11111, OnRead, OnWrite, NULL, NULL, OnEvent, NULL);
+	if (hdisk == INVALID_HANDLE_VALUE)
+	{
+		deb("VdskCreateVirtualDisk: %s", fmterr());
+		deb(" -- STOP -- Critical error.");
+		return;
+	}
+	VdskMountDisk(hdisk, drive_letter, true);
+	if (!VdskStartDisk(hdisk, true))
+		MessageBox(NULL, DiskEvent ? "VDSK_DISK_EVENT_DEADLOCK" : "VDSK_DISK_EVENT_NONE", "EVENT", MB_OK);
+	// else
+	deb("      -- готово");
+}
+
+BOOL __stdcall OnFormat(IN HANDLE hDisk, IN DWORD Progress, IN PVOID Context)
+{
+	// deb("OnFormat %x: %d", hDisk, Progress);
+	// return IO_OP_STATUS_SUCCESS;
+	// deb("progress %d",Progress);
+	// if ( ((int)xx % 2) != 0)
+	if (Progress > 0)
+	{
+		// formatp = p;
+		char str[333];
+		if (Progress >= 100)
+			sprintf(str, "");
+		else
+			sprintf(str, "Форматировано %d %%", Progress);
+		deb(str);
+		// Form1->Canvas->Font->Size = 10;
+		// Form1->Canvas->Font->Color = clCream;
+		// Form1->Canvas->Brush->Style = bsClear;
+		// Form1->Canvas->Brush->Color = clSilver;
+		// Form1->Canvas->TextOutA(Form1->ptr->Left, Form1->ptr->Top-(Form1->Canvas->TextHeight(str)),
+		// str);
+		// Form1->current->Text = str;
+		// // Form1->OnPaint(0);
+		//
+		// Application->ProcessMessages();
+	}
+	return IO_OP_STATUS_SUCCESS;
+}

@@ -1,0 +1,11 @@
+#include "ff.h"
+#include "netfiles.h"
+#include "vdskapi.h"
+#include "disk.h"
+#include "functions.h"
+#include "extern.h"
+#include <vector>
+#include "ftp.h"
+#include "cache.h"
+#pragma hdrstop
+TCriticalSection *filescs = 0;

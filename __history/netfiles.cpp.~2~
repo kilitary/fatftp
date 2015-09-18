@@ -1,0 +1,23 @@
+#include "ff.h"
+#include "netfiles.h"
+#include "vdskapi.h"
+#include "disk.h"
+#include "functions.h"
+#include "extern.h"
+#include <vector>
+#include "ftp.h"
+#include "cache.h"
+#pragma hdrstop
+
+
+TCriticalSection *filescs = 0;
+
+bool filesortdisk(FATFILE f1, FATFILE f2)
+{
+	return f1.lastdisktime < f2.lastdisktime;
+}
+
+void files_sort_diskevent(void)
+{
+	sort(files.begin(), files.end(), filesortdisk);
+}

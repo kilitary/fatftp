@@ -1,0 +1,6 @@
+#include "ff.h"
+
+
+bool _ftptrylock(char *f,int line);
+void _ftplock(char *func, int line);
+void _ftpunlock(char *func, int line);
